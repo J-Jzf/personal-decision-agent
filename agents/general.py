@@ -18,7 +18,7 @@ class GeneralAgent(BaseReActAgent):
         resolver = getattr(context.model_adapter, "resolve_general_task_or_fallback", None)
         if callable(resolver) and context.request is not None:
             delegation_planner = getattr(context.model_adapter, "plan_general_delegations_or_fallback", None)
-            if callable(delegation_planner) and callable(context.specialist_delegate):
+            if task.allow_factual_delegation and callable(delegation_planner) and callable(context.specialist_delegate):
                 plan = await delegation_planner(
                     task=task, request=context.request, memory=context.memory,
                     execution_context=context.execution_context,

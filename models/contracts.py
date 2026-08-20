@@ -154,6 +154,10 @@ class TaskSpec(ContractModel):
     dependencies: list[str] = Field(default_factory=list)
     required_capabilities: list[str] = Field(default_factory=list)
     completion_criteria: list[str] = Field(default_factory=list)
+    # 仅由专家内部计划转化出的下游综合任务填写；标识其消费的上游 target，而非重新检索对象。
+    source_target_ids: list[str] = Field(default_factory=list)
+    required_evidence: list[str] = Field(default_factory=list)
+    allow_factual_delegation: bool = True
     status: TaskStatus = TaskStatus.PENDING
 
     @property
@@ -291,16 +295,43 @@ class InformationTarget(ContractModel):
     settlement_criteria: list[dict[str, Any]] = Field(default_factory=list, max_length=3)
 
 
+class DownstreamTaskHandoff(ContractModel):
+    """专家内部发现的跨 target 派生工作，由 Controller 转为下游 DAG 任务。"""
+
+    handoff_id: str = Field(min_length=1, max_length=80, pattern=r"^[a-z0-9][a-z0-9._:-]*$")
+    objective: str = Field(min_length=1, max_length=500)
+    agent: Literal[AgentName.GENERAL] = AgentName.GENERAL
+    work_kind: Literal[TaskWorkKind.SYNTHESIS] = TaskWorkKind.SYNTHESIS
+    source_target_ids: list[str] = Field(min_length=1, max_length=5)
+    required_evidence: list[str] = Field(default_factory=list, max_length=8)
+    completion_criteria: list[str] = Field(default_factory=list, max_length=3)
+    allow_factual_delegation: bool = True
+
+    @field_validator("source_target_ids")
+    @classmethod
+    def source_target_identifiers_are_unique(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(_validate_identifier_list(values)))
+
+
 class ExpertInformationPlan(ContractModel):
     """专家任务内部的信息目标计划，受五项目标的调用成本上限约束。"""
 
     targets: list[InformationTarget] = Field(min_length=1, max_length=5)
+    downstream_handoffs: list[DownstreamTaskHandoff] = Field(default_factory=list, max_length=3)
 
     @model_validator(mode="after")
     def target_identifiers_are_unique(self) -> "ExpertInformationPlan":
         identifiers = [item.target_id for item in self.targets]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("information target IDs must be unique")
+        known_targets = set(identifiers)
+        handoff_ids = [item.handoff_id for item in self.downstream_handoffs]
+        if len(handoff_ids) != len(set(handoff_ids)):
+            raise ValueError("downstream handoff IDs must be unique")
+        for handoff in self.downstream_handoffs:
+            unknown = set(handoff.source_target_ids) - known_targets
+            if unknown:
+                raise ValueError(f"unknown source target IDs in downstream handoff: {', '.join(sorted(unknown))}")
         return self
 
 

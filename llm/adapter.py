@@ -320,12 +320,14 @@ class ModelAdapter:
             tool_reference = self._tool_reference(tools)
             # 将运行时状态整理成稳定字段，而不是让模型从零散 Trace 中猜测目标和覆盖进度。
             normalized_context = self._react_context_payload(task, request, memory, observations, execution_context)
+            react_task = task.model_dump(mode="json")
+            react_task.pop("objective", None)
             return await self._structured_with_repair(
                 operation="react",
-                system="你是受限 ReAct 专家。只依据任务、用户请求、记忆、已观察到的结果和允许工具行动。"
+                system="你是受限 ReAct 专家。只依据用户请求、当前 target 局部状态、记忆、已观察到的结果和允许工具行动。"
                 "调用工具时 action 必须为 call_tool，且 tool_name 必须逐字选择 allowed_tools 中的一个 name；不得输出 capability。"
                 "调用工具时必须完全符合该 tool_name 对应 input_schema；网页抓取工具通常需要 URL，不得把搜索 query 当 URL。"
-                "必须阅读 execution_context.react_context。它只包含用户问题、Task、当前 target、当前 target completion_criteria、"
+                "必须阅读 execution_context.react_context。它只包含用户问题、当前 task ID、当前 target、当前 target completion_criteria、"
                 "当前 target observations、latest_summary、coverage、missing_information、剩余额度及必要记忆和用户约束。"
                 "不得根据或索取其他 target 的摘要、缺口、状态或证据；这些资料不属于当前行动的上下文。"
                 "当选择 finish 时，必须填写 target_resolution：target_id 必须等于当前信息目标，status 只能为 complete、partial 或 blocked，"
@@ -337,7 +339,7 @@ class ModelAdapter:
                 "失败时优先改参数、换工具或请求重规划；同工具同参数若此前失败、超时或不可用，不得再次调用；信息显著不足时可请求最多三个用户补充字段。"
                 "public_summary 只能描述将做什么及公开依据，不得暴露私有思维链。",
                 payload={
-                    "task": task.model_dump(mode="json"), "request": request.model_dump(mode="json"),
+                    "task": react_task, "request": request.model_dump(mode="json"),
                     "memory": memory.model_dump(mode="json"),
                     "observations": normalized_context.get("current_task_history", []),
                     "allowed_tools": tool_reference,
@@ -543,7 +545,10 @@ class ModelAdapter:
                 operation="expert_information_plan",
                 system=(
                     "你是专家任务规划器。仅根据用户问题、当前任务、记忆、已有信息和允许工具，输出 ExpertInformationPlan JSON。"
-                    "最多规划五个信息目标；每项必须是完成当前任务所必需、可观察、可独立完成的资料目标。"
+                    "最多规划五个信息目标；每项必须是完成当前任务所必需、可观察、可独立完成的原子资料目标。"
+                    "不得把汇总、比较、推断、推荐、排序、风险评估，或依赖其他 target 结果的工作写进 targets。"
+                    "这类派生工作必须写入 downstream_handoffs：引用本计划内 source_target_ids，并交给 general 的 synthesis 下游任务。"
+                    "downstream_handoffs 不是工具调用目标；它会由 Controller 转为依赖当前任务的 DAG 节点，并只消费上游有效 Evidence、结算摘要与最终缺口。"
                     "不要按行业关键词套模板，不要编造用户信息或外部事实。"
                     "target_id 必须稳定、仅用小写字母数字和 . _ - :；同一目标后续 ReAct 必须复用该 ID。"
                     "每个目标最多三项 completion_criteria，且每项只能是完成当前目标不可缺少的最低证据门槛；"
@@ -634,7 +639,11 @@ class ModelAdapter:
         target_id = active_target.get("target_id")
         target_coverage = normalized.get("information_coverage", {}).get(target_id, {}) if target_id else {}
         react_context.setdefault("用户问题", request.query)
-        react_context.setdefault("Task", {"task_id": task.task_id, "objective": task.objective})
+        existing_task = react_context.get("Task")
+        if isinstance(existing_task, dict):
+            react_context["Task"] = {key: value for key, value in existing_task.items() if key != "objective"}
+        else:
+            react_context["Task"] = {"task_id": task.task_id}
         react_context.setdefault("当前 target", active_target)
         react_context.setdefault("当前 target completion_criteria", active_target.get("completion_criteria", task.completion_criteria))
         prompt_history = [

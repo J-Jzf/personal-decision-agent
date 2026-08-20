@@ -43,6 +43,8 @@ def test_react_context_is_limited_to_the_active_target_and_its_history():
     assert view["当前 target 已有 observations"][0]["status"] == "failed"
     assert view["当前 target latest_summary"] == "苏州温度已取得"
     assert view["当前 target missing_information"] == ["苏州降雨"]
+    assert view["Task"] == {"task_id": "weather"}
+    assert task.objective not in str(view)
     assert "所有 target" not in view
     assert "所有任务" not in view
     assert "南京已完成" not in str(view)
@@ -621,6 +623,30 @@ def test_agent_result_excludes_historical_failures_and_keeps_only_final_target_g
 
     assert "历史参数错误：city=Nanjing" not in result.uncertainties
     assert "苏州周日降雨概率" in result.uncertainties
+
+
+def test_information_planner_keeps_derived_work_as_a_controller_handoff():
+    """专家执行器必须保存 handoff，供 Controller 在任务结束后构造下游 DAG。"""
+    from models.contracts import DownstreamTaskHandoff, ExpertInformationPlan, InformationTarget, TaskSpec
+
+    class Adapter:
+        async def information_plan_or_fallback(self, **kwargs):
+            return ExpertInformationPlan(
+                targets=[InformationTarget(target_id="source", objective="取得原子事实")],
+                downstream_handoffs=[DownstreamTaskHandoff(
+                    handoff_id="derive", objective="基于原子事实形成推断", source_target_ids=["source"],
+                )],
+            )
+
+    context = AgentContext(
+        decision_id="d", memory=MemoryContext(), model_adapter=Adapter(), request=DecisionRequest(query="测试"),
+    )
+    asyncio.run(BaseReActAgent()._ensure_information_targets(
+        TaskSpec(task_id="facts", objective="取得事实", agent=AgentName.EVIDENCE_RESEARCH), context,
+    ))
+
+    assert [item["target_id"] for item in context.information_targets] == ["source"]
+    assert context.downstream_handoffs[0]["handoff_id"] == "derive"
 
 
 def test_general_agent_delegates_factual_work_then_synthesizes_results():

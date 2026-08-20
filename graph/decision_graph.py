@@ -24,7 +24,7 @@ from evidence.pool import EvidencePool
 from evidence.verifier import EvidenceVerifier
 from models.contracts import (
     AgentName, DecisionRequest, DecisionResponse, Episode, Evidence,
-    EvidenceStatus, ExecutionPlan, HITLRequest, HITLResponse, HITLStatus, TaskSpec, TaskStatus,
+    DownstreamTaskHandoff, EvidenceStatus, ExecutionPlan, HITLRequest, HITLResponse, HITLStatus, TaskSpec, TaskStatus,
     ToolCallStatus, WorkflowEvent, WorkflowStatus,
 )
 from .routing import route_after_execution, should_debate
@@ -364,6 +364,19 @@ class DecisionGraph:
             for observation in context.observations:
                 if self._observation_is_usable_evidence(observation):
                     await self._record_observation_evidence(state, pool, task, observation)
+            downstream_tasks = self.materialize_downstream_tasks(
+                task, [DownstreamTaskHandoff.model_validate(item) for item in context.downstream_handoffs],
+            )
+            existing_task_ids = {item.task_id for item in state.plan.tasks}
+            downstream_tasks = [item for item in downstream_tasks if item.task_id not in existing_task_ids]
+            if downstream_tasks:
+                state.plan.tasks.extend(downstream_tasks)
+                self._register_tasks(state, downstream_tasks)
+                await self._event(
+                    state, "downstream_tasks_materialized", "已创建跨目标下游任务",
+                    "跨 target 的派生工作已从专家内部计划转为依赖明确的下游综合任务。",
+                    {"parent_task_id": task.task_id, "tasks": [item.model_dump(mode="json") for item in downstream_tasks]}, publisher,
+                )
             completed = self.satisfied_task_ids(state.agent_results)
             await self._event(
                 state, "agent_task_completed", "专家 Agent 完成任务", result.summary,
@@ -403,6 +416,21 @@ class DecisionGraph:
                 "completion_criteria": list(task.completion_criteria),
                 "status": previous.get("status", "pending"),
             }
+
+    @staticmethod
+    def materialize_downstream_tasks(parent_task: TaskSpec,
+                                     handoffs: list[DownstreamTaskHandoff]) -> list[TaskSpec]:
+        """把专家内部的跨 target 交接项转成依赖父任务的 General DAG 节点。"""
+        return [
+            TaskSpec(
+                task_id=f"{parent_task.task_id}.downstream.{handoff.handoff_id}",
+                objective=handoff.objective, agent=handoff.agent, work_kind=handoff.work_kind,
+                dependencies=[parent_task.task_id], completion_criteria=handoff.completion_criteria,
+                source_target_ids=handoff.source_target_ids, required_evidence=handoff.required_evidence,
+                allow_factual_delegation=handoff.allow_factual_delegation,
+            )
+            for handoff in handoffs
+        ]
 
     @staticmethod
     def _set_task_status(state: DecisionState, task: TaskSpec, status: str, result: Any | None = None) -> None:
@@ -602,6 +630,8 @@ class DecisionGraph:
     def _react_execution_context(state: DecisionState, task: TaskSpec,
                                  pool: EvidencePool) -> dict[str, Any]:
         """给每轮专家决策提供跨任务进度，避免遗忘已完成工作或重复已失败调用。"""
+        if task.agent == AgentName.GENERAL and task.source_target_ids:
+            return DecisionGraph._downstream_general_execution_context(state, task, pool)
         # 此集合同时驱动依赖解锁和 Prompt 中的“已完成任务”，必须与任务状态语义保持一致。
         completed_ids = {
             task_id for task_id, entry in state.task_ledger.items()
@@ -661,6 +691,56 @@ class DecisionGraph:
                 "current_missing_information": list(state.plan.missing_information) if state.plan else [],
             },
             "latest_progress_summary": state.progress_summaries[-1] if state.progress_summaries else {},
+        }
+
+    @staticmethod
+    def _downstream_general_execution_context(state: DecisionState, task: TaskSpec,
+                                              pool: EvidencePool) -> dict[str, Any]:
+        """为跨 target 派生任务筛选声明的上游结算结果，排除无关任务和失败历史。"""
+        source_tasks = set(task.dependencies)
+        source_targets = set(task.source_target_ids)
+        target_summaries = [
+            {
+                "task_id": task_id,
+                "target_id": target.get("target_id"),
+                "status": target.get("status"),
+                "latest_summary": target.get("latest_summary"),
+                "missing_information": list(target.get("missing_information", [])),
+            }
+            for task_id in source_tasks
+            for target in state.information_targets.get(task_id, [])
+            if target.get("target_id") in source_targets
+        ]
+        evidence_ledger = [
+            observation.model_dump(mode="json")
+            for observation in state.tool_observations
+            if observation.task_id in source_tasks
+            and observation.target_id in source_targets
+            and DecisionGraph._observation_is_usable_evidence(observation)
+        ]
+        successful_evidence = [
+            {
+                "claim": evidence.claim, "value": evidence.value,
+                "source": evidence.source, "tool": evidence.tool,
+            }
+            for evidence in pool.list()
+            if evidence.status in {EvidenceStatus.CONFIRMED, EvidenceStatus.UNVERIFIED}
+            and any(evidence.scope_key.startswith(f"{task_id}|{target_id}|") for task_id in source_tasks for target_id in source_targets)
+        ]
+        return {
+            "user_question": state.request.query,
+            "current_task": task.model_dump(mode="json"),
+            "handoff_context": {
+                "upstream_task_ids": sorted(source_tasks),
+                "source_target_ids": list(task.source_target_ids),
+                "required_evidence": list(task.required_evidence),
+                "upstream_target_summaries": target_summaries,
+                "upstream_missing_information": [
+                    missing for item in target_summaries for missing in item["missing_information"]
+                ],
+                "evidence_ledger": evidence_ledger,
+                "successful_evidence": successful_evidence,
+            },
         }
 
     @staticmethod

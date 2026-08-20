@@ -11,6 +11,7 @@ from .contracts import (
     DecisionRequest,
     DecisionResponse,
     DecisionType,
+    DownstreamTaskHandoff,
     Evidence,
     EvidenceStatus,
     Episode,
@@ -38,7 +39,7 @@ from .contracts import (
 
 __all__ = [
     "AgentName", "AgentExecutionContract", "AGENT_EXECUTION_CONTRACTS", "AgentResult", "ContinueRequest", "DecisionListItem", "DecisionReport",
-    "DecisionRequest", "DecisionResponse", "DecisionType", "Episode", "Evidence", "EvidenceStatus",
+    "DecisionRequest", "DecisionResponse", "DecisionType", "DownstreamTaskHandoff", "Episode", "Evidence", "EvidenceStatus",
     "ExecutionPlan", "FeedbackRequest", "FeedbackResponse", "GeneralTaskResolution", "GeneralDelegationPlan", "GeneralDelegationRequest", "MemoryContext", "ProfileMemory",
     "RetrospectiveRequest", "TaskSpec", "TaskStatus", "TaskWorkKind", "TargetCriterionSettlement", "TargetSettlementSubmission",
     "ToolBindingAssessment", "ToolCallStatus", "ToolDescriptor",

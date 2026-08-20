@@ -297,6 +297,7 @@ def test_react_repairs_invalid_json_with_schema_tool_reference_and_user_informat
         assert "查询指定城市和日期的天气预报" in calls[0]["messages"][1]["content"]
         assert "上海 8 月 23 日天气" in calls[0]["messages"][1]["content"]
         assert "用户问题" in calls[0]["messages"][1]["content"]
+        assert "查询天气" not in calls[0]["messages"][1]["content"]
         assert "当前 target completion_criteria" in calls[0]["messages"][1]["content"]
         assert "当前 target 已有 observations" in calls[0]["messages"][1]["content"]
         assert "信息达到可支持结论的参考程度即可" in calls[0]["messages"][0]["content"]

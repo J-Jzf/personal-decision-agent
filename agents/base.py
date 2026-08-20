@@ -39,6 +39,7 @@ class AgentContext(BaseModel):
     evidence_ledger: dict[str, dict[str, Any]] = Field(default_factory=dict)
     specialist_delegate: Any = None
     delegated_results: list[dict[str, Any]] = Field(default_factory=list)
+    downstream_handoffs: list[dict[str, Any]] = Field(default_factory=list)
 
     async def trace(self, kind: str, title: str, summary: str, payload: dict[str, Any]) -> None:
         """向所属决策的实时轨迹写入一条可公开展示的行动说明。"""
@@ -297,9 +298,10 @@ class BaseReActAgent:
         if context.model_adapter is not None and context.request is not None:
             plan = await context.model_adapter.information_plan_or_fallback(task=task, request=context.request, memory=context.memory, tools=context.available_tools, execution_context=context.execution_context)
             context.information_targets = [item.model_dump(mode="json") for item in plan.targets]
+            context.downstream_handoffs = [item.model_dump(mode="json") for item in plan.downstream_handoffs]
         else:
             context.information_targets = [{"target_id": f"{task.task_id}-primary", "objective": task.objective, "completion_criteria": task.completion_criteria, "status": "pending", "tool_calls_used": 0}]
-        await context.trace("expert_information_plan", "专家信息目标计划", "专家已拆分当前任务需要补齐的信息目标。", {"task_id": task.task_id, "agent": self.name.value, "targets": context.information_targets})
+        await context.trace("expert_information_plan", "专家信息目标计划", "专家已拆分当前任务需要补齐的原子信息目标。", {"task_id": task.task_id, "agent": self.name.value, "targets": context.information_targets, "downstream_handoffs": context.downstream_handoffs})
 
     async def _summarize_observation(self, task: TaskSpec, context: AgentContext,
                                      observation: ToolObservation) -> ToolObservation:
@@ -561,7 +563,7 @@ class BaseReActAgent:
         hitl = context.request.context.get("hitl", {}) if context.request is not None else {}
         return {
             "用户问题": context.request.query if context.request is not None else "",
-            "Task": {"task_id": task.task_id, "objective": task.objective},
+            "Task": {"task_id": task.task_id},
             "当前 target": active_target,
             "当前 target completion_criteria": list(active_target.get("completion_criteria", task.completion_criteria)),
             "当前 target 已有 observations": prompt_history,

@@ -271,6 +271,66 @@ def test_progress_summary_keeps_only_final_target_gaps_not_repaired_failure_hist
     assert summary["仍缺少或存在冲突的信息"] == ["苏州周日降雨概率"]
 
 
+def test_controller_materializes_cross_target_handoff_as_a_downstream_general_task():
+    """跨 target 派生工作必须成为依赖当前事实任务的下游 DAG 节点。"""
+    from models.contracts import AgentName, DownstreamTaskHandoff, TaskSpec
+
+    parent = TaskSpec(task_id="facts", objective="取得原子事实", agent=AgentName.EVIDENCE_RESEARCH)
+    handoff = DownstreamTaskHandoff(
+        handoff_id="compare", objective="基于来源事实形成比较",
+        source_target_ids=["source-a", "source-b"], required_evidence=["A", "B"],
+    )
+
+    task = DecisionGraph.materialize_downstream_tasks(parent, [handoff])[0]
+
+    assert task.agent is AgentName.GENERAL
+    assert task.work_kind.value == "synthesis"
+    assert task.dependencies == ["facts"]
+    assert task.source_target_ids == ["source-a", "source-b"]
+    assert task.required_evidence == ["A", "B"]
+
+
+def test_downstream_general_context_contains_only_declared_upstream_target_outputs():
+    """下游综合只能消费声明的上游 target 结果，不能获得无关任务或失败历史。"""
+    from models.contracts import AgentName, AgentResult, ExecutionPlan, TaskSpec, TaskStatus, ToolObservation, ToolCallStatus
+
+    parent = TaskSpec(task_id="facts", objective="取得事实", agent=AgentName.EVIDENCE_RESEARCH)
+    downstream = TaskSpec(
+        task_id="facts.downstream.compare", objective="综合比较", agent=AgentName.GENERAL,
+        work_kind="synthesis", dependencies=["facts"], source_target_ids=["source-a"], required_evidence=["A"],
+    )
+    state = DecisionState(
+        decision_id="d", request=DecisionRequest(query="比较"), plan=ExecutionPlan(tasks=[parent, downstream]),
+        information_targets={"facts": [
+            {"target_id": "source-a", "status": "complete", "latest_summary": "A 已确认"},
+            {"target_id": "source-b", "status": "complete", "latest_summary": "B 不应传入"},
+        ]},
+        agent_results=[
+            AgentResult(result_id="parent", decision_id="d", task_id="facts", agent_name=AgentName.EVIDENCE_RESEARCH,
+                        findings=["A 已确认", "B 不应传入"], completion_status=TaskStatus.COMPLETED),
+            AgentResult(result_id="other", decision_id="d", task_id="unrelated", agent_name=AgentName.EVIDENCE_RESEARCH,
+                        findings=["无关资料"], completion_status=TaskStatus.COMPLETED),
+        ],
+        tool_observations=[
+            ToolObservation(call_id="a", decision_id="d", task_id="facts", target_id="source-a", agent=AgentName.EVIDENCE_RESEARCH,
+                            tool_name="search", status=ToolCallStatus.SUCCEEDED, result_summary="A 原始资料"),
+            ToolObservation(call_id="b", decision_id="d", task_id="facts", target_id="source-b", agent=AgentName.EVIDENCE_RESEARCH,
+                            tool_name="search", status=ToolCallStatus.SUCCEEDED, result_summary="B 原始资料"),
+            ToolObservation(call_id="failed", decision_id="d", task_id="facts", target_id="source-a", agent=AgentName.EVIDENCE_RESEARCH,
+                            tool_name="search", status=ToolCallStatus.FAILED, error="历史失败"),
+        ],
+    )
+
+    context = DecisionGraph._react_execution_context(state, downstream, EvidencePool())
+
+    assert context["handoff_context"]["upstream_target_summaries"] == [
+        {"task_id": "facts", "target_id": "source-a", "status": "complete", "latest_summary": "A 已确认", "missing_information": []},
+    ]
+    assert [item["call_id"] for item in context["handoff_context"]["evidence_ledger"]] == ["a"]
+    assert "all_successful_information" not in context
+    assert "failed_tools" not in context
+
+
 def test_replan_without_an_executable_task_is_rejected():
     """重规划不能只输出缺口说明；无任务时应直接转入后续判断。"""
     assert not DecisionGraph.has_executable_replan_tasks([], ["上海 23 日天气缺失"])

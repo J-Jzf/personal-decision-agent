@@ -220,3 +220,30 @@ def test_task_declares_structured_work_kind_and_target_limits_criteria_to_necess
         InformationTarget(
             target_id="weather", objective="天气", completion_criteria=["a", "b", "c", "d"],
         )
+
+
+def test_expert_plan_separates_cross_target_synthesis_into_a_structured_handoff():
+    """依赖多个 target 的派生结论不能伪装成另一个 ReAct target。"""
+    from models.contracts import DownstreamTaskHandoff, ExpertInformationPlan, InformationTarget
+
+    plan = ExpertInformationPlan(
+        targets=[
+            InformationTarget(target_id="source-a", objective="获得 A 的原子事实"),
+            InformationTarget(target_id="source-b", objective="获得 B 的原子事实"),
+        ],
+        downstream_handoffs=[DownstreamTaskHandoff(
+            handoff_id="compare", objective="基于 A 与 B 的事实形成保守比较",
+            source_target_ids=["source-a", "source-b"], required_evidence=["A 事实", "B 事实"],
+        )],
+    )
+
+    assert plan.targets[0].objective == "获得 A 的原子事实"
+    assert plan.downstream_handoffs[0].agent.value == "general"
+
+    with pytest.raises(ValidationError, match="unknown source target"):
+        ExpertInformationPlan(
+            targets=[InformationTarget(target_id="source-a", objective="获得 A 的原子事实")],
+            downstream_handoffs=[DownstreamTaskHandoff(
+                handoff_id="compare", objective="形成比较", source_target_ids=["missing-target"],
+            )],
+        )
