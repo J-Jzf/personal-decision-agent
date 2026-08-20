@@ -141,6 +141,8 @@ POST /decision 或 POST /decision/stream
 
 Plan-and-Execute 总控 → 专家内部 ReAct → 当前 Information Target → 参数绑定预检 → MCP → Observation 语义核验 → 当前 Target Settlement → Evidence/Findings → 总控摘要 → 固定终局 General → Replan/Verify → Judge 最终整合 → Memory/Archive
 
+专家路由：专家路由不是“关键词分类”，而是基于Planner LLM 先为每个任务给出的结构化 `work_kind`、Agent 执行契约和工具 capability 的任务—专家匹配与校验机制。如果 Planner 指定的 Agent 不支持该 work_kind 或所需 capability，系统会尝试改派给能够执行的 Agent；找不到合适专家时再回退到 general。真正调用 MCP 时，还会继续检查工具的 allowed_agents 和实际工具能力，避免 Agent 越权调用工具。
+
 `DecisionGraph._run()` 是整个总工作流的主干，专家执行后还会把结果、覆盖状态、工具观察、Evidence、progress summary 都重新汇总到总状态里。完整 Observation（包括失败）用于 Trace 与审计；总控长期摘要只读取最终 target 结算出的未解决缺口。
 
 并且做了以下设计：
