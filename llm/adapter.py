@@ -277,6 +277,7 @@ class ModelAdapter:
             "当 execution_context.unmet_gaps 非空时，plan.tasks 必须至少包含一项可执行的新任务或恢复任务；"
             "每个任务的 objective 必须明确写出要补齐的缺口、使用哪个允许能力或专家分析、以及完成条件。"
             "不得用空任务数组、泛泛的‘继续调查’或重复已完成任务冒充重规划。\n\n"
+            "不要在 plan 的最后生成“全局最终汇总/最终推荐”的 General task；框架会自动追加。\n\n"
             f"{STRUCTURED_OUTPUT_RULES}。该对象必须严格符合以下 JSON Schema：\n"
             f"{json.dumps(output_schema, ensure_ascii=False)}\n\n{AUTONOMOUS_PLAN_FIELD_CONTRACT}\n\n"
             f"允许的决策类型：{json.dumps([item.value for item in DecisionType], ensure_ascii=False)}\n"
@@ -599,7 +600,7 @@ class ModelAdapter:
                 "不输出私有思维链、建议或 Markdown。",
                 payload={
                     "user_query": query, "task_objective": task_objective,
-                    "tool_name": tool_name, "raw_result": raw_result[:12000],
+                    "tool_name": tool_name, "raw_result": raw_result[:16000],
                 },
                 schema=TraceSummary,
             )

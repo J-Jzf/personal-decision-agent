@@ -29,7 +29,7 @@ describe('TracePanel', () => {
       { event_id: '2', decision_id: 'd-1', to_state: 'executing', kind: 'agent_task_completed', title: '专家 Agent 完成任务', summary: '', sequence: 2, payload: { task_id: 'weather', completion_status: 'completed' }, created_at: '2026-08-18T00:00:01Z' },
     ]} />)
 
-    expect(screen.getByLabelText('任务 weather：已完成')).toBeTruthy()
+    expect(screen.getByLabelText('任务 weather：已完成')).toHaveTextContent('●')
     expect(screen.getByText('查询天气')).toBeTruthy()
   })
 
@@ -48,6 +48,18 @@ describe('TracePanel', () => {
       { event_id: '2', decision_id: 'd-1', to_state: 'executing', kind: 'information_coverage_updated', title: '已更新当前信息目标覆盖状态', summary: '', sequence: 2, payload: { task_id: 'weather', updates: [{ target_key: 'comparison', status: 'partial' }] }, created_at: '2026-08-18T00:00:01Z' },
     ]} />)
 
-    expect(container.querySelector('.task-dot-partial')).toBeTruthy()
+    expect(container.querySelector('.task-dot-partial')).toHaveTextContent('◐')
+  })
+
+  it('uses the blocked symbol for both a blocked task and target', () => {
+    const { container } = render(<TracePanel status="running" events={[
+      { event_id: '1', decision_id: 'd-1', to_state: 'planned', kind: 'plan_created', title: '已制定执行计划', summary: '', sequence: 1, payload: { plan: { tasks: [{ task_id: 'weather', objective: '查询天气', agent: 'location_lifestyle' }] } }, created_at: '2026-08-18T00:00:00Z' },
+      { event_id: '2', decision_id: 'd-1', to_state: 'executing', kind: 'expert_information_plan', title: '专家信息目标计划', summary: '', sequence: 2, payload: { task_id: 'weather', targets: [{ target_id: 'comparison', objective: '比较两地天气', status: 'pending', tool_calls_used: 0 }] }, created_at: '2026-08-18T00:00:01Z' },
+      { event_id: '3', decision_id: 'd-1', to_state: 'executing', kind: 'agent_task_completed', title: '专家 Agent 完成任务', summary: '', sequence: 3, payload: { task_id: 'weather', completion_status: 'blocked' }, created_at: '2026-08-18T00:00:02Z' },
+      { event_id: '4', decision_id: 'd-1', to_state: 'executing', kind: 'information_target_status', title: '信息目标状态更新', summary: '', sequence: 4, payload: { task_id: 'weather', target_id: 'comparison', status: 'blocked', tool_calls_used: 3 }, created_at: '2026-08-18T00:00:03Z' },
+    ]} />)
+
+    expect(screen.getByLabelText('任务 weather：已阻塞')).toHaveTextContent('⊘')
+    expect(container.querySelector('.task-dot-blocked')).toHaveTextContent('⊘')
   })
 })

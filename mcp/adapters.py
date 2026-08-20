@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 
-def normalize_tool_result(result: Any, limit: int = 12000) -> str:
+def normalize_tool_result(result: Any, limit: int = 16000) -> str:
     if result is None:
         return ""
     if hasattr(result, "model_dump"):

@@ -14,7 +14,7 @@
 ## 主要能力
 
 - **模型主导规划：** 总控 LLM 读取问题、记忆、8 个 Skill 和已发现 MCP 工具的 Schema，自主输出决策类型、参考 Skill、专家任务、依赖、完成条件、核验/辩论标记和可选 HITL 问题。模型不可用或结构化输出连续失败时才使用本地确定性降级。
-- **任务级多 Agent：** 计划以显式 `work_kind` 和统一执行合同选择 `evidence_research`、`financial_market`、`location_lifestyle`、`preference`、`general`、`risk_critic`，不再按 objective 关键词猜测职责。前三者运行 ReAct 和 MCP；偏好专家只读取记忆；`general` 不直连 MCP，但可最多委派三项外部事实给三类检索专家后再综合；风险专家做规则式对抗检查。
+- **任务级多 Agent：** 计划以显式 `work_kind` 和统一执行合同选择 `evidence_research`、`financial_market`、`location_lifestyle`、`preference`、`general`、`risk_critic`，不再按 objective 关键词猜测职责。前三者运行 ReAct 和 MCP；偏好专家只读取记忆；`general` 不直连 MCP，但可最多委派三项外部事实给三类检索专家后再综合；风险专家做规则式对抗检查。每一版计划还会固定追加一个终局 General：它在其余专家之后汇总完整总控状态，再把中间综合判断交给最终 Judge LLM。
 - **信息目标与 ReAct：** 每个可调用工具的专家先规划最多 5 个原子信息目标、每目标最多 3 项必要 completion criteria；跨 target 的比较、推断、排序、推荐或风险评估会以结构化 handoff 交给 Controller 转成下游 General DAG task。每个目标独立最多 6 次调用前语义预检和 3 次 MCP 调用。ReAct 只看到当前 target 的完成条件、Settlement 逐项状态、观察、覆盖、摘要、缺口、额度与必要用户约束/记忆；不会看到其他 target 的详情。额度耗尽后，有可用资料的专家任务会以 `completed_with_gaps` 交给后续保守判断。
 - **HITL：** 规划或执行阶段可向用户追问。前端提供最多三个动态字段、自由文本、跳过和 30 秒倒计时自动跳过；同一决策最多两次 HITL。用户填写内容进入当前请求上下文，也作为可追溯画像候选原文。
 - **证据与核验：** MCP 传输成功后，LLM 还会依据用户问题、当前目标、完成条件、参数和结果，判定 `relevant`、`partial`、`irrelevant` 或 `unverifiable`。只有相关/部分相关结果才成为带来源、工具、置信度、状态和 `scope_key` 的 Evidence；无关结果保留 Trace，但不污染证据。相同范围资料再交给模型判断支持、补充、矛盾或不确定。
@@ -34,7 +34,7 @@ flowchart TD
     H -- 是 --> HI[填写 / 跳过 / 30 秒超时] --> P
     H -- 否 --> X[按计划列表顺序执行依赖已完成的任务]
     X --> R[检索专家：模型规划原子 targets 与可选 handoff]
-    X --> NR[Preference / General / RiskCritic]
+    X --> NR[Preference / 普通 General / RiskCritic]
     NR --> A[保存 AgentResult、Evidence 与总控进度]
     R --> RA[ReAct：只处理当前信息目标]
     RA --> PB[LLM 参数绑定预检：每目标最多 6 次]
@@ -49,12 +49,13 @@ flowchart TD
     C -- partial / 仍有缺口 --> RA
     NT -- 是，按数组顺序 --> RA
     NT -- 否 --> DH{有 downstream handoff？}
-    DH -- 是 --> MT[Controller 实体化为依赖父任务的 General synthesis task]
+    DH -- 是 --> MT[Controller 实体化为下游 General synthesis task]
     MT --> A
     DH -- 否 --> A
-    A --> NX{还有可执行任务？}
+    A --> NX{还有未执行的非终局任务？}
     NX -- 是 --> X
-    NX -- 否 --> RP{总控判定缺口关键且可补救？}
+    NX -- 否 --> TG[固定终局 General：读取完整总控摘要；必要时委派事实专家]
+    TG --> RP{总控判定缺口关键且可补救？}
     RP -- 是，未达 3 次 --> P
     RP -- 否 --> V{计划要求核验或有冲突？}
     V -- 是 --> EV[EvidenceVerifier]
@@ -95,7 +96,7 @@ var/                  本地 SQLite/Qdrant 数据（Git 忽略）
 3. `app/container.py`：`build_services()` 是唯一装配点：创建 Settings、SQLite/repository、MemoryManager、SkillRegistry、MCPGateway、ModelAdapter、Planner/Judge 和 DecisionGraph。**核心（依赖边界）**。
 4. `app/api/routes.py`：`POST /decision` 调用 `services.graph.run()`；`POST /decision/stream` 调用 `services.graph.stream()` 并编码 SSE；HITL、继续执行、读取归档、反馈和回顾也从这里进入。**核心（请求入口）**。
 5. `models/contracts.py`：阅读请求、状态和跨层 JSON 合同，尤其是 `DecisionRequest`、`AutonomousPlan`、`TaskSpec`、`ExpertInformationPlan`、`InformationTarget`、`DownstreamTaskHandoff`、`ToolObservation`、`AgentResult`、`DecisionReport`。**核心（所有层共享的类型边界）**。
-6. `graph/states.py` → `graph/decision_graph.py`：前者定义 `DecisionState`；后者的 `run()` / `stream()` / `_run()` 驱动完整生命周期：记忆、规划、执行、动态 handoff 下游任务、重规划、核验、裁判、归档。重点阅读 `_execute()`、`_react_execution_context()`、`materialize_downstream_tasks()`、`build_progress_summary()`。**核心（总控状态机）**。
+6. `graph/states.py` → `graph/decision_graph.py`：前者定义 `DecisionState`；后者的 `run()` / `stream()` / `_run()` 驱动完整生命周期：记忆、规划、执行、动态 handoff 下游任务、固定终局 General、重规划、核验、裁判、归档。重点阅读 `_execute()`、`_react_execution_context()`、`materialize_downstream_tasks()`、`insert_downstream_tasks_before_terminal()`、`build_progress_summary()`。**核心（总控状态机）**。
 7. `agents/planner.py` → `llm/adapter.py`：Planner 依据 `work_kind` 和执行契约校验任务路由；Adapter 集中全部生产 Prompt、完整 Schema 注入、结构化修复与保守降级。重点方法依次是 `autonomous_plan_or_fallback()`、`information_plan_or_fallback()`、`react_or_fallback()`、`assess_tool_binding_or_fallback()`、`assess_observation_or_fallback()`、Settlement、General 委派和 `judge_or_fallback()`。**核心（LLM 合同与决策阶段）**。
 8. `agents/base.py` → `agents/evidence_research.py` / `financial_market.py` / `location_lifestyle.py`：`BaseReActAgent.execute()` 是事实专家的目标级执行循环；重点阅读原子 target 计划、单向推进、参数预检、MCP 调用、语义评估、Settlement、handoff 保存和最终 AgentResult。**核心（target-local ReAct）**。
 9. `agents/general.py` → `agents/preference.py` / `risk_critic.py` / `judge.py`：General 消费下游 handoff 的受限上游上下文并可有界委派事实专家；其余 Agent 分别处理偏好、规则式风险审查和最终 Judge 调用。**核心（非 ReAct 执行器）**。
@@ -118,15 +119,16 @@ POST /decision 或 POST /decision/stream
   -> Planner / ModelAdapter：依据请求、MemoryContext、Skill 目录、工具目录生成 AutonomousPlan
   -> 若 Planner 请求 HITL：等待提交、跳过或超时；合入用户文本后重新生成计划
   -> 决策类型确定后调用 MemoryManager.context_for()：同类型 Episode 检索 + 同类别 Profile
-   -> 记录 Skill、计划与任务账本；按任务 DAG 执行依赖已 completed 或 completed_with_gaps 的普通任务
+   -> 记录 Skill、计划与任务账本；Planner 固定在每版计划末尾追加普通终局 General；按任务 DAG 执行依赖已 completed 或 completed_with_gaps 的普通任务
         -> 检索专家：先建 ExpertInformationPlan（原子 targets + 可选 downstream_handoffs），再按计划顺序逐目标 ReAct；每个目标各有 6 次参数预检与 3 次 MCP 调用额度
         -> 每次 call_tool 先做当前 target 参数绑定预检；未绑定只反馈 ReAct，不调用 MCP
         -> 每次成功 MCP 返回先由 LLM 作当前 target 语义核验；仅 supports_current_target=true 的 relevant/partial 观察进入当前 target Settlement 和正式 Evidence
         -> Settlement 按 completion_criteria 逐项结算；只有 target_complete=true 才结束当前 target，否则以 partial 返回 ReAct 继续补资料
-        -> Controller 将 downstream_handoffs 转为依赖当前任务的 General synthesis task；General 只接收声明 target 的有效 Evidence、结算摘要与最终缺口
+        -> Controller 将 downstream_handoffs 转为依赖当前任务的 General synthesis task，并插入终局 General 之前；该下游 General 只接收声明 target 的有效 Evidence、结算摘要与最终缺口
         -> preference：只读取 MemoryContext；general：必要时最多委派三项外部事实给事实专家，再用结构化 LLM 完成综合、比较或推荐
        -> risk_critic：检查约束、无证据、未核验、冲突、陈旧与过度宣称
        -> 每任务保存 AgentResult、任务账本、总控进度摘要和 checkpoint
+   -> 所有前序任务都已被处理后：终局 General 读取完整总控摘要；若关键外部事实仍缺失，可按普通 General 的有界委派机制补查，然后输出中间综合判断
    -> 若有未完成资料：总控先判断缺口是否会实质改变结论且有可执行补救；只有两者均为真、且未达 REPLAN_LIMIT 才生成替代任务
   -> requires_verification 或 Evidence 冲突：进入 EvidenceVerifier
   -> requires_debate 或 Evidence 冲突：进入 DebateModerator
@@ -137,7 +139,7 @@ POST /decision 或 POST /decision/stream
 
 ### 主链路
 
-Plan-and-Execute 总控 → 专家内部 ReAct → 当前 Information Target → 参数绑定预检 → MCP → Observation 语义核验 → 当前 Target Settlement → Evidence/Findings → 总控摘要 → Replan/Verify → Judge 最终整合 → Memory/Archive
+Plan-and-Execute 总控 → 专家内部 ReAct → 当前 Information Target → 参数绑定预检 → MCP → Observation 语义核验 → 当前 Target Settlement → Evidence/Findings → 总控摘要 → 固定终局 General → Replan/Verify → Judge 最终整合 → Memory/Archive
 
 `DecisionGraph._run()` 是整个总工作流的主干，专家执行后还会把结果、覆盖状态、工具观察、Evidence、progress summary 都重新汇总到总状态里。完整 Observation（包括失败）用于 Trace 与审计；总控长期摘要只读取最终 target 结算出的未解决缺口。
 
@@ -221,7 +223,7 @@ completed / completed_with_gaps / blocked
 
 ### DAG：任务依赖与 target 的单向推进
 
-系统有两层依赖关系。外层是 `AutonomousPlan.plan.tasks` 的任务依赖图：本地确定性计划会按前序依赖构造 DAG；执行器按列表顺序，仅在依赖已 `completed` 或 `completed_with_gaps` 时运行任务，`blocked`、`failed`、`skipped` 不可解除依赖。模型自主计划的合同已拒绝未知/自依赖，但当前尚未做依赖环检测或自动拓扑重排；不满足的任务会被跳过，后续由重规划或最终判断处理。重规划会移除已完成任务及其已满足依赖，只保留仍可补救的任务。专家内部计划中的 `downstream_handoffs` 不在 target 序列执行：Controller 将其实体化为依赖父任务的 General synthesis task，因此派生工作可读取声明的上游 target 结算，而原子检索仍保持 target-local。
+系统有两层依赖关系。外层是 `AutonomousPlan.plan.tasks` 的任务依赖图：普通 task 按列表顺序，仅在依赖已 `completed` 或 `completed_with_gaps` 时运行，`blocked`、`failed`、`skipped` 不可解除普通下游依赖。模型自主计划的合同已拒绝未知/自依赖，但当前尚未做依赖环检测或自动拓扑重排；不满足的普通任务会被跳过，后续由重规划或最终判断处理。每版计划最后由 Planner 固定加入 `terminal_general=true` 的 General task；它收集所有前序 task ID 作为**顺序依赖**，并在那些 task 已完成、带缺口、失败或跳过后仍执行一次，确保最终综合不会因为某一专家失败而消失。重规划会移除已完成任务及其已满足依赖，只保留仍可补救的任务，并生成新的、唯一 ID 的终局 General。专家内部计划中的 `downstream_handoffs` 不在 target 序列执行：Controller 将其实体化为依赖父任务的 General synthesis task，插入终局 General 之前并写入该收尾节点的顺序依赖，因此派生工作先完成，原子检索仍保持 target-local。
 
 内层是单个 ReAct 专家任务的 target 序列，而不是第二张可回跳图。`BaseReActAgent.execute()` 按 `ExpertInformationPlan.targets` 的数组顺序遍历：一个 target 的 ReAct、预检、MCP、语义核验和 Settlement 都在本地循环内完成。只有 `target_complete=true` 才提前结束；出现 partial 则留在当前 target 继续；达到该 target 的 MCP 或预检额度后，已有 partial Settlement 的状态会保留为 partial，未形成 partial/complete 结算的状态标为 blocked，然后才推进到数组中的下一个 target。框架没有“回到前一个 target”的边，也不会把后续 target 尚未完成视为当前 target 的缺口。
 
@@ -232,7 +234,9 @@ flowchart LR
     T2 -->|complete / partial / blocked 后固定前进| T3[Target 3]
     T3 --> H[Controller 实体化 handoff]
     H --> G[下游 General synthesis task]
-    G --> R[全局综合/后续判断]
+    O[其余普通专家 task] --> TG[终局 General：完整总控摘要]
+    G --> TG
+    TG --> J[Judge 最终报告]
 ```
 
 LLM ReAct 决定下一动作
@@ -255,7 +259,7 @@ request_human_input
 
 #### 三个 ReAct 专家与一个通用 Agent
 
-三个 ReAct 专家的区别主要只是工具域，真正的执行逻辑都在 `BaseReActAgent`。`PreferenceAgent` 和 `RiskCritic` 重写了 `execute()`，所以不走 ReAct；`GeneralAgent` 不直连 MCP：它可先以结构化合同请求最多三项事实委派（仅三个 ReAct 专家），再以一次结构化 LLM 调用综合返回资料。Planner 以 `work_kind` 与统一执行合同校验 Agent，而不是解析 objective 的关键词。
+三个 ReAct 专家的区别主要只是工具域，真正的执行逻辑都在 `BaseReActAgent`。`PreferenceAgent` 和 `RiskCritic` 重写了 `execute()`，所以不走 ReAct；`GeneralAgent` 不直连 MCP：它可先以结构化合同请求最多三项事实委派（仅三个 ReAct 专家），再以一次结构化 LLM 调用综合返回资料。终局 General 复用完全相同的 `GeneralAgent.execute()`，并非另一种输出模型；Planner 以 `work_kind` 与统一执行合同校验 Agent，而不是解析 objective 的关键词。
 
 EvidenceResearchAgent 负责通用外部事实/网页/地点资料，主要允许：
 
@@ -295,7 +299,7 @@ market_data
 实际的 ReAct 状态机基本完全相同。
 
 对于总控全局信息，
-- General Agent：普通 General task 可读取总控提供的执行上下文；由 `downstream_handoffs` 创建的 General task 则只读取声明上游 target 的有效资料、结算摘要和最终缺口，不读取无关任务或失败历史。
+- General Agent：普通 General task 可读取总控提供的执行上下文；终局 General 就是普通 General，因 `source_target_ids=[]` 而读取完整的总控任务账本、已完成 task 结论、有效 Evidence、覆盖/target 结算、最终缺口和最新 Progress Summary，并可按原有上限委派事实专家；由 `downstream_handoffs` 创建的 General task 则只读取声明上游 target 的有效资料、结算摘要和最终缺口，不读取无关任务或失败历史。
 - ReAct 三个检索专家：在生成 Information Plan 时可以看到总控传入的执行上下文；但真正进入每个 target 的 ReAct 执行后，只保留当前 task ID、当前 target、当前 target 历史/缺口和必要记忆，不会看到 `TaskSpec.objective`、其他 target 的全局细节。
 - Preference / RiskCritic：走各自独立的 execute()，不是统一的 ReAct 隔离逻辑；它们能看到什么取决于各自 execute() 传了哪些 context。
 
@@ -335,6 +339,7 @@ market_data
         "dependencies": ["必须先 completed 的 task_id"],
         "required_capabilities": ["如 web_search、weather_forecast"],
         "completion_criteria": ["任务完成条件"],
+        "terminal_general": false,
         "status": "pending | running | completed | completed_with_gaps | failed | blocked | skipped"
       }
     ],
@@ -351,7 +356,7 @@ market_data
 }
 ```
 
-这是总控 LLM 的首次输出，也是重规划时复用的同一合同。`task_id` 在一个 `plan.tasks` 内唯一；`dependencies` 只能引用同一计划内存在的任务，且不能引用自身。执行器按 `plan.tasks` 的列表顺序执行，只有前置任务已经 `completed` 或 `completed_with_gaps` 才运行；未满足依赖的任务会标为 `skipped`，交给重规划或最终判断。当前合同尚未做完整的拓扑排序或依赖环检测。`agent` 只能从六种专家中选择；Planner 用显式 `work_kind`、Agent 执行契约与允许 capability 核验该 Agent 的实际 `execute()` 能力，不匹配时改派 `general`。每个 ReAct 任务能否调用工具，还受 MCP 注册表的 `allowed_agents`、能力和工具 Schema 约束。其 `plan` 会写入 `DecisionState.plan`、任务账本、`plan_created`/`plan_replanned` Trace、SQLite checkpoint 和最终归档的 `decision_archives.plan_json`；`planning_summary` 用于前端公开轨迹。
+这是总控 LLM 的首次输出，也是重规划时复用的同一合同。`task_id` 在一个 `plan.tasks` 内唯一；`dependencies` 只能引用同一计划内存在的任务，且不能引用自身。执行器按 `plan.tasks` 的列表顺序执行，普通任务只有前置任务已经 `completed` 或 `completed_with_gaps` 才运行；未满足依赖的普通任务会标为 `skipped`，交给重规划或最终判断。当前合同尚未做完整的拓扑排序或依赖环检测。`agent` 只能从六种专家中选择；Planner 用显式 `work_kind`、Agent 执行契约与允许 capability 核验该 Agent 的实际 `execute()` 能力，不匹配时改派 `general`。随后 Planner 无条件移除模型自行标记的终局节点及其他任务指向它的旧依赖，并在列表末尾追加一个 `terminal_general=true` 的 `general` / `synthesis` task；它的 `dependencies` 列出全部前序 task，只用于保证收尾顺序，即使某个前序任务最终 blocked/failed/skipped，终局 General 仍会在其余任务都已处理后运行，以便综合有效资料与最终缺口。这个终局 General 与普通 General 使用完全相同的 `execute()` 和有界事实委派能力，唯一差别是 Controller 调度标记；它没有 `source_target_ids`，因此接收完整总控执行上下文。每个 ReAct 任务能否调用工具，还受 MCP 注册表的 `allowed_agents`、能力和工具 Schema 约束。其 `plan` 会写入 `DecisionState.plan`、任务账本、`plan_created`/`plan_replanned` Trace、SQLite checkpoint 和最终归档的 `decision_archives.plan_json`；`planning_summary` 用于前端公开轨迹。
 
 `status` 这里是计划任务的初始/账本状态；真正的专家结果使用下面的 `AgentResult.completion_status`。`completed` 与 `completed_with_gaps` 都能解除普通下游依赖：后者会连同公开缺口进入综合与最终报告。`blocked`、`failed`、`skipped` 没有可用资料，不能解除依赖。
 
@@ -410,7 +415,7 @@ market_data
 
 `targets` 至少 1 个、最多 5 个，`target_id` 在任务内唯一，每个 target 最多 3 项必要 completion criteria。它们只能是当前事实专家可独立完成的原子资料目标：不得把依赖其他 target 结果的汇总、比较、推断、排序、推荐或风险评估写入 `targets`。这类派生工作写入最多 3 项 `downstream_handoffs`；每项只能指定 `general` / `synthesis`，且 `source_target_ids` 必须引用本计划已有 target。执行器开始 target 时补入运行时 `binding_calls_used`。两者上限分别为 3 与 6：预检被拒绝只消耗预检额度，实际进入 Gateway 才消耗 MCP 额度。Settlement 会把 `criteria` 和 `missing_information` 回写 target，供下一轮 ReAct 直接使用。`pending` 是尚未处理，`partial` 表示 Settlement 已确认有累计进展但尚未逐项满足完成条件，`complete` 是 Settlement 已确认全部条件满足，`blocked` 是该局部循环结束时仍未形成 partial/complete 结算。
 
-专家执行结束后，Controller 将每个 handoff 变为 `parent_task_id.downstream.handoff_id` 的独立 `TaskSpec`：`agent=general`、`work_kind=synthesis`、`dependencies=[parent_task_id]`。依赖任务达到 `completed` 或 `completed_with_gaps` 后，该 General task 才运行。它接收的执行上下文被收窄为声明的上游 task 与 `source_target_ids` 的 target `latest_summary`、`missing_information`、通过语义核验的 Observation/Evidence，以及 `required_evidence`；无关 task、未声明 target 和失败历史不会传入。若仍有会实质改变结论的外部事实缺口，且 `allow_factual_delegation=true`，General 才可使用既有有界事实委派补查。
+专家执行结束后，Controller 将每个 handoff 变为 `parent_task_id.downstream.handoff_id` 的独立 `TaskSpec`：`agent=general`、`work_kind=synthesis`、`dependencies=[parent_task_id]`。依赖任务达到 `completed` 或 `completed_with_gaps` 后，该 General task 才运行。它会被插入当前计划的终局 General 之前，同时加入终局 General 的顺序依赖，不能在收尾综合之后才运行。该下游 General 的执行上下文被收窄为声明的上游 task 与 `source_target_ids` 的 target `latest_summary`、`missing_information`、通过语义核验的 Observation/Evidence，以及 `required_evidence`；无关 task、未声明 target 和失败历史不会传入。若仍有会实质改变结论的外部事实缺口，且 `allow_factual_delegation=true`，General 才可使用既有有界事实委派补查。
 
 #### 5. 专家每轮选择行动：`ReActDecision`
 
@@ -494,7 +499,7 @@ Gateway 完成一次调用后先产生：
 }
 ```
 
-其中 `status` 是**传输/策略状态**：`succeeded` 只代表 MCP 正常返回；`failed` 是调用错误；`denied` 是只读策略、权限或参数被拒绝；`unavailable` 是提供方不可用；`timed_out` 是超时。若原始内容超过 1,500 字符，LLM 的 `TraceSummary` 输出 `{"summary":"..."}` 替换公开摘要；模型不可用时才保守截断。
+其中 `status` 是**传输/策略状态**：`succeeded` 只代表 MCP 正常返回；`failed` 是调用错误；`denied` 是只读策略、权限或参数被拒绝；`unavailable` 是提供方不可用；`timed_out` 是超时。Gateway 对任意单次工具原始返回整体最多保留前 16,000 字符；若这段内容超过 1,500 字符，摘要 LLM 读取最多 16,000 字符并以 `TraceSummary` 输出 `{"summary":"..."}` 替换公开摘要；模型不可用时才保守保留前 1,500 字符。
 
 只要 `status=succeeded` 且有结果，LLM 会再输出：
 
@@ -629,7 +634,7 @@ Gateway 完成一次调用后先产生：
 - **MCP：stdio JSON-RPC。** Gateway 为每个配置启动本地子进程，经标准输入/输出执行 `initialize`、`tools/list`、`tools/call`。它是后端到本地 MCP 的协议，不是浏览器接口。
 - **前端 Trace：HTTP SSE。** 浏览器用 `fetch` POST 到 `/decision/stream`，读取 `text/event-stream` 帧。事件带 `sequence`、`kind`、中文标题、摘要和 payload。
 
-长工具结果或错误超过 1,500 字符时，模型会按用户问题、任务和工具名提炼公开摘要；模型不可用或摘要合同失败时才保留脱敏后的前 1,500 字符。脱敏只遮蔽明确的凭据字段，例如 `api_key`、`token`、`secret`、`authorization`、`password` 及对应后缀；`target_key`、任务 ID 等普通业务字段会保留。
+任意单次 MCP 工具返回先整体保留前 16,000 字符。长工具结果或错误超过 1,500 字符时，模型会按用户问题、任务和工具名读取这最多 16,000 字符并提炼公开摘要；模型不可用或摘要合同失败时才保留脱敏后的前 1,500 字符。脱敏只遮蔽明确的凭据字段，例如 `api_key`、`token`、`secret`、`authorization`、`password` 及对应后缀；`target_key`、任务 ID 等普通业务字段会保留。
 
 ## 自主规划、重规划与 HITL
 
@@ -637,7 +642,7 @@ Gateway 完成一次调用后先产生：
 
 ### Planner 如何分配 Agent 与 Skill
 
-模型优先在 `AutonomousPlan` 中同时选择 `decision_type`、`skill_name` 和每项 `TaskSpec` 的 `objective`、`work_kind`、`agent`、依赖、完成条件与所需 capability。Planner 不直接相信这份分配：它先确认 `skill_name` 是当前 `SkillRegistry` 已加载的名称，再按统一执行合同检查 Agent 是否支持该 `work_kind` 与所需 capability；不再解析 objective 的关键词判断职责。
+模型优先在 `AutonomousPlan` 中同时选择 `decision_type`、`skill_name` 和每项 `TaskSpec` 的 `objective`、`work_kind`、`agent`、依赖、完成条件与所需 capability。Prompt 明确要求模型不要在 `plan` 的最后生成“全局最终汇总/最终推荐”的 General task，因为框架会自动追加。Planner 不直接相信这份分配：它先确认 `skill_name` 是当前 `SkillRegistry` 已加载的名称，再按统一执行合同检查 Agent 是否支持该 `work_kind` 与所需 capability；不再解析 objective 的关键词判断职责。完成路由后，Planner 固定追加一项 `terminal_general=true` 的 General task，作为该版计划的最后一个 task；这不是让模型自行决定的可选任务。模型仍可规划带明确上游依赖的局部 General 综合任务。
 
 | Agent | 真实执行职责 | 目标关键词示例 |
 |---|---|---|
@@ -650,7 +655,7 @@ Gateway 完成一次调用后先产生：
 
 若模型选中的 Agent 不支持该 `work_kind`，Planner 从执行合同中选择支持该类型与 capability 的 Agent；没有匹配时才保守改派 `general`。`required_capabilities` 还会与运行时发现工具及合同允许能力取交集。`general` 没有 MCP capability，外部事实只能通过事实专家委派获得。
 
-Skill 不是强制的静态路由。总控模型在 Prompt 提供的 8 个 Skill 中选择一个可用 `skill_name`，并参考该 Skill 的推荐 Agent/工具、分析维度、工作流、风险检查和完成条件来形成任务图；Planner 仅接受实际已加载的 Skill 名。模型不可用时，`Planner.create_plan()` 使用本地保守规则：基础任务是 `evidence_research` 与 `preference`；投资组合/金融关键词会加入 `financial_market`，旅行或地点关键词会加入 `location_lifestyle`，再合并所选 Skill 的 `recommended_agents`；最后总会加入依赖此前任务的 `general` 与 `risk_critic`。每个本地任务的推荐工具来自 Skill 的 `recommended_tools`，但仍会经过该 Agent 的能力过滤。
+Skill 不是强制的静态路由。总控模型在 Prompt 提供的 8 个 Skill 中选择一个可用 `skill_name`，并参考该 Skill 的推荐 Agent/工具、分析维度、工作流、风险检查和完成条件来形成任务图；Planner 仅接受实际已加载的 Skill 名。模型不可用时，`Planner.create_plan()` 使用本地保守规则：基础任务是 `evidence_research` 与 `preference`；投资组合/金融关键词会加入 `financial_market`，旅行或地点关键词会加入 `location_lifestyle`，再合并所选 Skill 的 `recommended_agents`，并加入 `risk_critic`；最后仍由 Planner 固定追加依赖全部前序任务的终局 `general`。每个本地任务的推荐工具来自 Skill 的 `recommended_tools`，但仍会经过该 Agent 的能力过滤。
 
 每轮 ReAct 的 `execution_context.react_context` 是严格的 target-local 视图：用户问题、当前 task ID（不含 `TaskSpec.objective`）、当前 target、当前 target 的 `completion_criteria`、该 target 的历史 Observation、`latest_summary`、当前覆盖状态、`missing_information`、两类剩余额度、当前专家的允许工具，以及必要的 `MemoryContext` 与 HITL 补充。适配器会过滤掉其他 target 的状态、摘要、缺口、观察与证据；即使全局 `DecisionState` 仍保存它们，ReAct 也不会收到。完整失败 Observation 只在状态与 Trace 中审计；仅预检或 ReAct 合同修正的当前 target 错误会作为一次性 `react_validation_error` 进入紧接着的下一轮，然后被清除，不会跨 target、task 或进入总控长期摘要。
 
@@ -670,7 +675,7 @@ HITL 请求由 `hitl_requested` Trace 事件携带。页面在该事件下显示
 | `financial_market` | 运行 ReAct，收集金融/市场资料 | `web_search`、`fetch_page`、`market_data` |
 | `location_lifestyle` | 运行 ReAct，收集地点、路线、天气资料 | `web_search`、`fetch_page`、`place_search`、`route_search`、`weather_forecast` |
 | `preference` | 只读已传入的长期 Profile | 无 |
-| `general` | 综合、比较、推断或推荐已有资料；必要时有界委派事实专家补查 | `synthesis`；自身无 MCP |
+| `general` | 综合、比较、推断或推荐已有资料；必要时有界委派事实专家补查。每版计划末尾的终局 General 也是同一执行器，但读取完整总控摘要 | `synthesis`；自身无 MCP |
 | `risk_critic` | 规则式风险、证据缺口与约束审查 | 无 |
 | `judge` | 汇总模型报告或本地降级报告 | 无 |
 | `debate_moderator` | 以 Evidence ID 组织正反结论 | 无 |
@@ -683,8 +688,8 @@ Gateway 只注册可映射为 `web_search`、`fetch_page`、`place_search`、`ro
 
 Information Planner 是专家内部组件；Controller 是全局外层；General 是独立专家 Agent：
 - Information Planner：在每个可调用工具的事实专家内部。例如 evidence_research、financial_market、location_lifestyle 执行前，先拆自己的原子 InformationTarget；涉及其他 target 结果的派生工作输出为 `downstream_handoffs`，不在 ReAct 序列执行。
-- Controller：在专家外部的全局总控层，负责整个 DAG、任务依赖、执行顺序、Replan，并将 handoff 转为依赖父任务的下游 General task。
-- General：是一个独立的 Agent，和其他专家同级，不在某个专家内部；它负责跨任务/跨 target 的综合、比较、推断和推荐。
+- Controller：在专家外部的全局总控层，负责整个 DAG、任务依赖、执行顺序、Replan，将 handoff 转为依赖父任务的下游 General task，并把它们插到固定终局 General 之前。
+- General：是一个独立的 Agent，和其他专家同级，不在某个专家内部；它负责跨任务/跨 target 的综合、比较、推断和推荐。终局 General 只是由 Planner 固定追加、带调度标记的普通 General task：它接收完整总控摘要，仍可委派事实专家；之后 Judge 才产生直接面向用户的最终报告。
 
 简单结构就是：
 
@@ -697,8 +702,8 @@ Controller
 ├─ financial_market
 │  └─ Information Planner → Targets → ReAct
 ├─ preference
-├─ general
-└─ risk_critic
+├─ risk_critic
+└─ terminal general（完整总控摘要；可委派）
 ```
 
 ## Skills
@@ -1004,8 +1009,10 @@ Invoke-RestMethod -Method Post `
 9. **互补证据被误判为矛盾：** 证据按任务、target、工具和参数建立 `scope_key`；只有同范围资料才交给模型判断 supports、complements、contradicts 或 uncertain，模型不可用时保守保持 uncertain。
 10. **`target_key` 被过宽脱敏：** 脱敏规则只遮蔽明确的凭据字段或凭据后缀，保留 target ID 与普通业务字段，以便 Trace 和前端正确显示状态。
 11. **已修复的执行失败持续污染总控：** 如果把参数错误、预检拒绝、失败调用或无关 Observation 直接塞进 `AgentResult.uncertainties`，即使后来已补齐资料，总控仍会把它当成当前缺口。现在 Trace/Observation 保存完整审计历史；ReAct 仅短暂保留当前 target 的一次性修正提示；AgentResult、Progress Summary 与 Replan 只读取任务结束时仍未解决的 target `missing_information`（无 target 任务才读取其公开 uncertainties）。
-12. **目标状态缺少部分完成视觉：** 前端以实心圆表示 complete、空心圆表示 pending/blocked、半实心圆表示 partial。
+12. **目标状态缺少部分完成与阻塞视觉：** 前端任务计划和信息目标统一使用 `●` 表示 complete、`◐` 表示 partial、`○` 表示 pending、`⊘` 表示 blocked；`failed` 与 `skipped` 在任务计划中同样显示为 `⊘`。符号颜色保持不变。
 13. **最终理由把“未找到”误写成“不存在”或彼此矛盾：** 最终裁判在输出前必须对推荐、事实、推断、取舍、风险和不确定性做一致性检查；没有证据只能标记“尚未证实”，不能做否定性事实断言。
+14. **最终输出前没有稳定的全局综合节点：** 若把综合完全留给 Judge，或只依赖 Planner 偶然分配的普通 General，最终回答前可能没有一个能读取全部已完成任务、有效证据和最终缺口的可委派综合者。现在 Planner 为每一版计划固定追加终局 General；动态 handoff 也会插入它之前。它在所有前序任务已处理后读取完整总控摘要，必要时仍可委派最多三项事实专家补查，先形成中间综合判断；现有 Judge LLM 继续保留，只以该结果和证据为输入产出最终用户回答。
+15. **比较类任务不能放在 ReAct 专家内部：** ReAct 的上下文工程刻意只暴露用户问题与当前 target 的局部资料，不能读取其他 target 的结算结论；若在其中执行跨 target 比较、推断、排序或推荐，模型只能重新搜索，或基于不完整上下文作判断。现在 Information Planner 必须把这类派生工作输出为 `downstream_handoffs`；Controller 再将其实体化为下游 `general` task。该 General 读取声明上游 target 的有效 Evidence、结算摘要与最终缺口，必要时可有界委派事实专家补查；它不会破坏 ReAct 的 target-local 隔离。
 
 ## Agent 测评与未来完善
 

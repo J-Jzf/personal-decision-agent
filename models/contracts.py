@@ -158,6 +158,8 @@ class TaskSpec(ContractModel):
     source_target_ids: list[str] = Field(default_factory=list)
     required_evidence: list[str] = Field(default_factory=list)
     allow_factual_delegation: bool = True
+    # Planner 为每版计划固定追加的收尾综合节点。它仍由普通 GeneralAgent 执行；标记只供 Controller 保证调度顺序。
+    terminal_general: bool = False
     status: TaskStatus = TaskStatus.PENDING
 
     @property

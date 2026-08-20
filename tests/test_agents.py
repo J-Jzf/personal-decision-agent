@@ -201,6 +201,48 @@ def test_planner_routes_synthesis_to_general_instead_of_preference_memory_reader
     assert not Planner.agent_can_execute(AgentName.PREFERENCE, "综合天气、景点和预算后推荐城市")
 
 
+def test_every_planner_plan_ends_with_a_terminal_general_task():
+    """无论前面分配了哪些专家，计划都必须以可委派的普通 General 收尾。"""
+    registry = SkillRegistry(__import__("pathlib").Path("skills")); registry.load_all()
+
+    plan = asyncio.run(Planner().create_plan(
+        DecisionRequest(query="比较南京和苏州的周末旅行安排"),
+        registry.get("travel-destination-compare"), DecisionType.TRAVEL,
+    ))
+
+    terminal = plan.tasks[-1]
+    assert terminal.agent is AgentName.GENERAL
+    assert terminal.work_kind.value == "synthesis"
+    assert terminal.terminal_general is True
+    assert terminal.allow_factual_delegation is True
+    assert terminal.source_target_ids == []
+    assert terminal.dependencies == [task.task_id for task in plan.tasks[:-1]]
+    assert "先评估" in terminal.objective
+    assert "必要时委派事实专家补齐" in terminal.objective
+
+
+def test_planner_discards_a_model_supplied_terminal_general_without_leaving_stale_dependencies():
+    """模型不得用自行声明的终局节点阻断其余任务；Planner 必须重建唯一收尾节点。"""
+    from models.contracts import ExecutionPlan, TaskSpec
+
+    model_terminal = TaskSpec(
+        task_id="model_final", objective="模型自定收尾", agent=AgentName.GENERAL,
+        work_kind="synthesis", terminal_general=True,
+    )
+    review = TaskSpec(
+        task_id="review", objective="审查证据", agent=AgentName.RISK_CRITIC,
+        work_kind="risk_review", dependencies=["model_final"],
+    )
+
+    plan = Planner.ensure_terminal_general(
+        ExecutionPlan(tasks=[model_terminal, review]), terminal_task_id="final_general",
+    )
+
+    assert [task.task_id for task in plan.tasks] == ["review", "final_general"]
+    assert plan.tasks[0].dependencies == []
+    assert plan.tasks[-1].dependencies == ["review"]
+
+
 def test_react_blocks_duplicate_tool_name_and_arguments_before_a_second_mcp_call():
     """重复的同工具同参数调用应作为失败观察反馈给专家，而非再次访问外部服务。"""
     task = __import__("models.contracts", fromlist=["TaskSpec"]).TaskSpec(

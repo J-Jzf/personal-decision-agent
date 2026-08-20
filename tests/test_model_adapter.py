@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 from app.config import Settings
 from llm.adapter import ModelAdapter
@@ -232,6 +233,7 @@ def test_model_drives_skill_and_expert_plan_from_catalog_and_tool_schema():
     assert result.plan.tasks[0].agent is AgentName.LOCATION_LIFESTYLE
     plan_prompt = PlannedClient.chat.completions.calls[0]["messages"][0]["content"]
     assert "信息达到可支持结论的参考程度即可" in plan_prompt
+    assert "不要在 plan 的最后生成“全局最终汇总/最终推荐”的 General task" in plan_prompt
     assert "保守推断" in plan_prompt
     assert "无需精确无误" in plan_prompt
 
@@ -342,11 +344,12 @@ def test_trace_summary_uses_question_and_tool_result_to_extract_public_key_point
         adapter = ModelAdapter(Settings(llm_model_id="fake", llm_api_key="key"), client=TraceSummaryClient())
         summary = await adapter.summarize_tool_result(
             query="这周末上海和桂林选哪个旅游？", task_objective="比较两地周末天气",
-            tool_name="get_weather_byDateTimeRange", raw_result="字段说明" * 600,
+            tool_name="get_weather_byDateTimeRange", raw_result="字段说明" * 5000,
         )
 
         assert "桂林周六晴朗" in summary
         request_body = TraceSummaryClient.chat.completions.calls[0]["messages"][1]["content"]
+        assert len(json.loads(request_body)["raw_result"]) == 16000
         assert "上海和桂林" in request_body
         assert "get_weather_byDateTimeRange" in request_body
 

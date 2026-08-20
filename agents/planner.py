@@ -17,11 +17,15 @@ class Planner:
 
     async def create_autonomous_plan(self, request: DecisionRequest, *, skills: list[SkillDefinition],
                                      tools: list[object], memory: MemoryContext,
-                                     execution_context: dict[str, object] | None = None) -> AutonomousPlan:
+                                     execution_context: dict[str, object] | None = None,
+                                     terminal_task_id: str = "final_general") -> AutonomousPlan:
         """优先让总控模型选 Skill、专家与 DAG；无模型时才返回保守本地计划。"""
         catalog = [definition.to_dict() | {"body": definition.body} for definition in skills]
         if self.model_adapter is None:
-            fallback = self.create_plan(request, next((item for item in skills if item.name == "risk-debate-moderator"), skills[0]), request.decision_type or DecisionType.GENERAL)
+            fallback = self.create_plan(
+                request, next((item for item in skills if item.name == "risk-debate-moderator"), skills[0]),
+                request.decision_type or DecisionType.GENERAL, terminal_task_id=terminal_task_id,
+            )
             return AutonomousPlan(decision_type=request.decision_type or DecisionType.GENERAL, skill_name="risk-debate-moderator", planning_summary="未配置模型，使用本地保守计划。", plan=await fallback)
         selected = await self.model_adapter.autonomous_plan_or_fallback(
             request, skills=catalog, tools=tools, memory=memory,
@@ -44,10 +48,13 @@ class Planner:
                 if capability in available_capabilities and capability in self._capabilities_for_agent(agent)
             ]
             tasks.append(task.model_copy(update={"agent": agent, "required_capabilities": permitted}))
-        plan = selected.plan.model_copy(update={"tasks": tasks})
+        plan = self.ensure_terminal_general(
+            selected.plan.model_copy(update={"tasks": tasks}), terminal_task_id=terminal_task_id,
+        )
         return selected.model_copy(update={"skill_name": skill_name, "plan": plan})
 
-    async def create_plan(self, request: DecisionRequest, skill: SkillDefinition, decision_type: DecisionType) -> ExecutionPlan:
+    async def create_plan(self, request: DecisionRequest, skill: SkillDefinition, decision_type: DecisionType,
+                          *, terminal_task_id: str = "final_general") -> ExecutionPlan:
         agents = self._agents_for(request, skill, decision_type)
         tasks: list[TaskSpec] = []
         task_ids: list[str] = []
@@ -62,13 +69,42 @@ class Planner:
             ))
             task_ids.append(identifier)
         requires_debate = "risk-debate-moderator" == skill.name or any(term in request.query for term in ("争议", "冲突", "高风险"))
-        return ExecutionPlan(
+        return self.ensure_terminal_general(ExecutionPlan(
             goal=request.query, tasks=tasks,
             missing_information=[],
             requires_verification="evidence_research" in {agent.value for agent in agents},
             requires_debate=requires_debate,
             replan_conditions=["关键资料持续不可用", "重要证据冲突", "硬约束违规", "Critic 提出关键遗漏"],
+        ), terminal_task_id=terminal_task_id)
+
+    @staticmethod
+    def ensure_terminal_general(plan: ExecutionPlan, *, terminal_task_id: str) -> ExecutionPlan:
+        """每版计划以普通 General 收尾；模型不能省略或抢先安排这个终局节点。"""
+        model_terminal_ids = {task.task_id for task in plan.tasks if task.terminal_general}
+        tasks = [
+            task.model_copy(update={
+                "dependencies": [dependency for dependency in task.dependencies if dependency not in model_terminal_ids],
+            })
+            for task in plan.tasks
+            if not task.terminal_general
+        ]
+        occupied_ids = {task.task_id for task in tasks}
+        task_id = terminal_task_id
+        suffix = 2
+        while task_id in occupied_ids:
+            task_id = f"{terminal_task_id}.{suffix}"
+            suffix += 1
+        terminal = TaskSpec(
+            task_id=task_id,
+            objective="先评估仍可能影响结论且可补救的缺口，必要时委派事实专家补齐；再汇总全部已执行专家的有效结论、证据、用户约束与最终未解决缺口，形成可追溯的中间综合判断，供最终报告使用。",
+            agent=AgentName.GENERAL,
+            work_kind=TaskWorkKind.SYNTHESIS,
+            dependencies=[task.task_id for task in tasks],
+            completion_criteria=["整合全部可用专家结论与有效证据", "明确仍可能影响结论的未解决缺口"],
+            allow_factual_delegation=True,
+            terminal_general=True,
         )
+        return plan.model_copy(update={"tasks": [*tasks, terminal]})
 
     def _agents_for(self, request: DecisionRequest, skill: SkillDefinition, decision_type: DecisionType) -> list[AgentName]:
         base = [AgentName.EVIDENCE_RESEARCH, AgentName.PREFERENCE]
@@ -83,7 +119,6 @@ class Planner:
                 continue
             if agent in AGENT_EXECUTION_CATALOG:
                 base.append(agent)
-        base.append(AgentName.GENERAL)
         base.append(AgentName.RISK_CRITIC)
         return list(dict.fromkeys(base))
 

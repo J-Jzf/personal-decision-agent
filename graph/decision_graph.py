@@ -123,6 +123,7 @@ class DecisionGraph:
         initial_memory = self.memory.context_for_any(state.request.query)
         autonomous = await self.planner.create_autonomous_plan(
             state.request, skills=self.skills.list(), tools=self.gateway.registry.list_capabilities(), memory=initial_memory,
+            terminal_task_id="final_general.initial",
         )
         for event in [item for item in self.judge.model_adapter.fallback_events if item.get("mode") == "structured_retry"]:
             await self._event(state, "model_output_retry", "总控结构化输出正在修正",
@@ -144,6 +145,7 @@ class DecisionGraph:
             )
             autonomous = await self.planner.create_autonomous_plan(
                 state.request, skills=self.skills.list(), tools=self.gateway.registry.list_capabilities(), memory=initial_memory,
+                terminal_task_id="final_general.initial",
             )
         state.decision_type = autonomous.decision_type
         has_deterministic_fallback = any(
@@ -180,7 +182,7 @@ class DecisionGraph:
             )
             replacement = await self.planner.create_autonomous_plan(
                 state.request, skills=self.skills.list(), tools=self.gateway.registry.list_capabilities(), memory=state.memory,
-                execution_context=self._replan_context(state, pool),
+                execution_context=self._replan_context(state, pool), terminal_task_id=f"final_general.replan.{state.replan_count}",
             )
             remaining_tasks, skipped_tasks = self.incremental_replan_tasks(state, replacement.plan)
             unmet_gaps = self._replan_context(state, pool)["unmet_gaps"]
@@ -267,7 +269,7 @@ class DecisionGraph:
             raise RuntimeError("cannot execute without a plan")
         completed: set[str] = set()
         for task in state.plan.tasks:
-            if not set(task.dependencies) <= completed:
+            if not task.terminal_general and not set(task.dependencies) <= completed:
                 missing_dependencies = sorted(set(task.dependencies) - completed)
                 self._set_task_status(state, task, TaskStatus.SKIPPED.value)
                 await self._event(
@@ -370,8 +372,10 @@ class DecisionGraph:
             existing_task_ids = {item.task_id for item in state.plan.tasks}
             downstream_tasks = [item for item in downstream_tasks if item.task_id not in existing_task_ids]
             if downstream_tasks:
-                state.plan.tasks.extend(downstream_tasks)
+                terminal_task = self.insert_downstream_tasks_before_terminal(state.plan, downstream_tasks)
                 self._register_tasks(state, downstream_tasks)
+                if terminal_task is not None:
+                    self._register_tasks(state, [terminal_task])
                 await self._event(
                     state, "downstream_tasks_materialized", "已创建跨目标下游任务",
                     "跨 target 的派生工作已从专家内部计划转为依赖明确的下游综合任务。",
@@ -431,6 +435,21 @@ class DecisionGraph:
             )
             for handoff in handoffs
         ]
+
+    @staticmethod
+    def insert_downstream_tasks_before_terminal(plan: ExecutionPlan, tasks: list[TaskSpec]) -> TaskSpec | None:
+        """动态 handoff 必须先完成，再由终局 General 读取全局最终状态。"""
+        terminal_index = next(
+            (index for index, task in enumerate(plan.tasks) if task.terminal_general),
+            None,
+        )
+        if terminal_index is None:
+            plan.tasks.extend(tasks)
+            return None
+        terminal = plan.tasks[terminal_index]
+        terminal.dependencies = list(dict.fromkeys([*terminal.dependencies, *(task.task_id for task in tasks)]))
+        plan.tasks[terminal_index:terminal_index] = tasks
+        return terminal
 
     @staticmethod
     def _set_task_status(state: DecisionState, task: TaskSpec, status: str, result: Any | None = None) -> None:

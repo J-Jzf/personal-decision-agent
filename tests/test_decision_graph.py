@@ -290,6 +290,27 @@ def test_controller_materializes_cross_target_handoff_as_a_downstream_general_ta
     assert task.required_evidence == ["A", "B"]
 
 
+def test_dynamic_downstream_task_is_placed_before_the_terminal_general_task():
+    """动态 handoff 不能在终局 General 之后执行，也必须成为其依赖。"""
+    from models.contracts import AgentName, ExecutionPlan, TaskSpec
+
+    parent = TaskSpec(task_id="facts", objective="取得原子事实", agent=AgentName.EVIDENCE_RESEARCH)
+    terminal = TaskSpec(
+        task_id="final_general", objective="汇总全部资料", agent=AgentName.GENERAL,
+        work_kind="synthesis", dependencies=["facts"], terminal_general=True,
+    )
+    downstream = TaskSpec(
+        task_id="facts.downstream.compare", objective="形成局部比较", agent=AgentName.GENERAL,
+        work_kind="synthesis", dependencies=["facts"], source_target_ids=["source-a"],
+    )
+    plan = ExecutionPlan(tasks=[parent, terminal])
+
+    DecisionGraph.insert_downstream_tasks_before_terminal(plan, [downstream])
+
+    assert [task.task_id for task in plan.tasks] == ["facts", "facts.downstream.compare", "final_general"]
+    assert terminal.dependencies == ["facts", "facts.downstream.compare"]
+
+
 def test_downstream_general_context_contains_only_declared_upstream_target_outputs():
     """下游综合只能消费声明的上游 target 结果，不能获得无关任务或失败历史。"""
     from models.contracts import AgentName, AgentResult, ExecutionPlan, TaskSpec, TaskStatus, ToolObservation, ToolCallStatus

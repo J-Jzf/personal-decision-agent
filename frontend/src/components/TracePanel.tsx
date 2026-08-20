@@ -5,7 +5,8 @@ import { HITLPrompt } from './HITLPrompt'
 
 type TracePanelProps = Pick<TraceMessageState, 'events' | 'status' | 'error'> & { onHitlResponse?: (decisionId: string, requestId: string, values: Record<string, string>, freeText: string, skip: boolean) => void }
 
-type PlanTask = { task_id: string; objective?: string; agent?: string; completed: boolean }
+type DisplayStatus = 'complete' | 'partial' | 'pending' | 'blocked'
+type PlanTask = { task_id: string; objective?: string; agent?: string; status: DisplayStatus }
 type InformationTarget = { key: string; taskId: string; targetId: string; objective: string; status: string; calls: number }
 
 const statusLabel: Record<TraceMessageState['status'], string> = {
@@ -13,6 +14,21 @@ const statusLabel: Record<TraceMessageState['status'], string> = {
   completed: '执行完成',
   error: '执行失败',
   disconnected: '实时连接中断',
+}
+
+function displayStatus(status: unknown): DisplayStatus {
+  if (status === 'complete' || status === 'completed') return 'complete'
+  if (status === 'partial' || status === 'completed_with_gaps') return 'partial'
+  if (status === 'blocked' || status === 'failed' || status === 'skipped') return 'blocked'
+  return 'pending'
+}
+
+function statusSymbol(status: DisplayStatus): string {
+  return { complete: '●', partial: '◐', pending: '○', blocked: '⊘' }[status]
+}
+
+function statusDescription(status: DisplayStatus): string {
+  return { complete: '已完成', partial: '部分完成', pending: '未完成', blocked: '已阻塞' }[status]
 }
 
 function safeDetail(value: unknown, key = ''): unknown {
@@ -53,18 +69,18 @@ function planTasks(events: WorkflowTraceEvent[]): PlanTask[] {
             task_id: task.task_id,
             objective: typeof task.objective === 'string' ? task.objective : previous?.objective,
             agent: typeof task.agent === 'string' ? task.agent : previous?.agent,
-            completed: previous?.completed ?? task.status === 'completed',
+            status: previous?.status ?? displayStatus(task.status),
           })
         }
       }
     }
     if (event.kind === 'agent_task_completed' && typeof payload.task_id === 'string') {
       const task = tasks.get(payload.task_id)
-      if (task) task.completed = payload.completion_status === 'completed'
+      if (task) task.status = displayStatus(payload.completion_status)
     }
     if (event.kind === 'replan_reused_work' && Array.isArray(payload.reused_completed_task_ids)) {
       for (const taskId of payload.reused_completed_task_ids) {
-        if (typeof taskId === 'string' && tasks.has(taskId)) tasks.get(taskId)!.completed = true
+        if (typeof taskId === 'string' && tasks.has(taskId)) tasks.get(taskId)!.status = 'complete'
       }
     }
   }
@@ -142,7 +158,7 @@ export function TracePanel({ events, status, error, onHitlResponse }: TracePanel
         <strong>任务计划</strong>
         <ol>
           {tasks.map((task) => <li key={task.task_id}>
-            <span aria-label={`任务 ${task.task_id}：${task.completed ? '已完成' : '未完成'}`} className={`task-dot ${task.completed ? 'task-dot-completed' : ''}`} />
+            <span aria-label={`任务 ${task.task_id}：${statusDescription(task.status)}`} className={`task-dot task-dot-${task.status}`}>{statusSymbol(task.status)}</span>
             <span className="task-plan-copy">{task.objective || task.task_id}</span>
             {task.agent && <small>{task.agent}</small>}
           </li>)}
@@ -151,7 +167,10 @@ export function TracePanel({ events, status, error, onHitlResponse }: TracePanel
       {targets.length > 0 && <section aria-label="专家信息目标计划" className="trace-plan trace-target-plan">
         <strong>专家信息目标计划</strong>
         <ol>{targets.map((target) => <li key={target.key}>
-          <span className={`task-dot ${target.status === 'complete' ? 'task-dot-completed' : target.status === 'partial' ? 'task-dot-partial' : ''}`} />
+          {(() => {
+            const targetStatus = displayStatus(target.status)
+            return <span aria-label={`信息目标 ${target.targetId}：${statusDescription(targetStatus)}`} className={`task-dot task-dot-${targetStatus}`}>{statusSymbol(targetStatus)}</span>
+          })()}
           <span className="task-plan-copy">{target.objective}</span><small>{target.status} · {target.calls}/3</small>
         </li>)}</ol>
       </section>}
