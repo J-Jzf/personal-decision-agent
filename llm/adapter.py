@@ -11,8 +11,8 @@ from pydantic import BaseModel, ValidationError
 from app.config import Settings
 from app.temporal_context import birth_year_range_from_age
 from models.contracts import (
-    AgentName, AnalysisMode, AutonomousPlan, DecisionReport, DecisionRequest,
-    DecisionType, Evidence, EvidenceRelationship, ExecutionPlan, ExpertInformationPlan, GeneralTaskResolution, InformationTarget, MemoryContext, ObservationAssessment, ObservationRelevance, ProfileSignalExtraction, ReActDecision, ReplanDecision, TargetResolution, TargetSettlementSubmission, TaskSpec, ToolBindingAssessment, ToolObservation, TraceSummary,
+    AGENT_EXECUTION_CONTRACTS, AgentName, AnalysisMode, AutonomousPlan, DecisionReport, DecisionRequest,
+    DecisionType, Evidence, EvidenceRelationship, ExecutionPlan, ExpertInformationPlan, GeneralDelegationPlan, GeneralTaskResolution, InformationTarget, MemoryContext, ObservationAssessment, ObservationRelevance, ProfileSignalExtraction, ReActDecision, ReplanDecision, TargetResolution, TargetSettlementSubmission, TaskSpec, ToolBindingAssessment, ToolObservation, TraceSummary,
 )
 
 
@@ -57,8 +57,8 @@ class DeterministicReasoner:
 
     def plan(self, request: DecisionRequest, decision_type: DecisionType = DecisionType.GENERAL) -> ExecutionPlan:
         return ExecutionPlan(goal=request.query, tasks=[
-            TaskSpec(task_id="preference", objective="整理显式偏好与历史偏好", agent=AgentName.PREFERENCE, completion_criteria=["偏好已结构化"]),
-            TaskSpec(task_id="critic", objective="检查硬约束、证据缺口和反例", agent=AgentName.RISK_CRITIC, dependencies=["preference"], completion_criteria=["关键风险已列出"]),
+            TaskSpec(task_id="preference", objective="整理显式偏好与历史偏好", agent=AgentName.PREFERENCE, work_kind="preference_matching", completion_criteria=["偏好已结构化"]),
+            TaskSpec(task_id="critic", objective="检查硬约束、证据缺口和反例", agent=AgentName.RISK_CRITIC, work_kind="risk_review", dependencies=["preference"], completion_criteria=["关键风险已列出"]),
         ], missing_information=["缺少可验证的外部证据"], replan_conditions=["关键资料不可用"])
 
     def autonomous_plan(self, request: DecisionRequest, skills: list[dict[str, Any]]) -> AutonomousPlan:
@@ -277,12 +277,14 @@ class ModelAdapter:
             f"{STRUCTURED_OUTPUT_RULES}。该对象必须严格符合以下 JSON Schema：\n"
             f"{json.dumps(output_schema, ensure_ascii=False)}\n\n{AUTONOMOUS_PLAN_FIELD_CONTRACT}\n\n"
             f"允许的决策类型：{json.dumps([item.value for item in DecisionType], ensure_ascii=False)}\n"
-            f"允许的专家 Agent 与各自当前可调用工具：{json.dumps(tool_permissions, ensure_ascii=False)}"
+            f"允许的专家 Agent 与各自当前可调用工具：{json.dumps(tool_permissions, ensure_ascii=False)}。"
+            "每项任务必须填写 work_kind，并且只能分配给载荷 execution_contracts 中支持该 work_kind 的 Agent。"
         )
         base_payload: dict[str, Any] = {
             "request": request.model_dump(mode="json"), "memory": memory.model_dump(mode="json"),
             "skills": skills, "tools": serialized_tools, "available_agents": allowed_agents,
             "execution_context": execution_context or {},
+            "execution_contracts": {name.value: contract.model_dump(mode="json") for name, contract in AGENT_EXECUTION_CONTRACTS.items()},
         }
         invalid_output = ""
         validation_error = ""
@@ -306,9 +308,9 @@ class ModelAdapter:
             return self.reasoner.autonomous_plan(request, skills)
 
     async def react_or_fallback(self, *, task: TaskSpec, request: DecisionRequest,
-                                memory: MemoryContext, observations: list[dict[str, Any]],
+                                            memory: MemoryContext, observations: list[dict[str, Any]],
                                 tools: list[Any], remaining_calls: int,
-                                remaining_binding_calls: int = 3,
+                                            remaining_binding_calls: int = 6,
                                 execution_context: dict[str, Any] | None = None) -> ReActDecision:
         """让专家模型在每轮根据真实工具 Schema 和观察结果选择下一步受控动作。"""
         try:
@@ -467,6 +469,27 @@ class ModelAdapter:
                 findings=[], uncertainties=["通用综合模型不可用"], completion_status="blocked",
             )
 
+    async def plan_general_delegations_or_fallback(self, *, task: TaskSpec, request: DecisionRequest,
+                                                   memory: MemoryContext, execution_context: dict[str, Any]) -> GeneralDelegationPlan:
+        """让 General 在综合前有界地请求事实专家，而不是直接获得工具。"""
+        try:
+            return await self._structured_with_repair(
+                operation="general_delegation_plan",
+                system=(
+                    "你是通用综合 Agent 的事实委派规划器。只在现有资料不足以回答当前综合任务且确实需要外部事实时委派。"
+                    "最多三项；只能选择 evidence_research、financial_market、location_lifestyle，"
+                    "每项必须选择与 agent 一致的 work_kind，并写最少的必要 completion_criteria。"
+                    "不得委派 general、preference 或 risk_critic；资料已足够时返回空 delegations。"
+                ),
+                payload={
+                    "task": task.model_dump(mode="json"), "request": request.model_dump(mode="json"),
+                    "memory": memory.model_dump(mode="json"), "execution_context": execution_context,
+                }, schema=GeneralDelegationPlan,
+            )
+        except Exception as error:
+            self._fallback("general_delegation_plan", error)
+            return GeneralDelegationPlan(reason="模型不可用，不新增事实委派。", delegations=[])
+
     async def replan_decision_or_fallback(self, *, request: DecisionRequest,
                                           execution_context: dict[str, Any]) -> ReplanDecision:
         """由总控判定未完成资料是否会实质改变结论且能否生成补救任务。"""
@@ -503,8 +526,9 @@ class ModelAdapter:
                     "最多规划五个信息目标；每项必须是完成当前任务所必需、可观察、可独立完成的资料目标。"
                     "不要按行业关键词套模板，不要编造用户信息或外部事实。"
                     "target_id 必须稳定、仅用小写字母数字和 . _ - :；同一目标后续 ReAct 必须复用该 ID。"
-                    "每个目标的 completion_criteria 要说明何种已观察资料才算足够；不要把最终推荐本身作为资料目标。"
-                    "优先创建最少、互不重复的目标；除硬约束外，不要把同一体验或偏好维度拆成大量精确数字、逐地点或逐时段验证。"
+                    "每个目标最多三项 completion_criteria，且每项只能是完成当前目标不可缺少的最低证据门槛；"
+                    "不要把最终推荐本身、可选信息、锦上添花细节、重复维度、精确数字、逐地点或逐时段验证写成强制条件。"
+                    "优先创建最少、互不重复的目标；除硬约束外，以可支持保守结论的资料为足够。"
                     f"{EVIDENCE_SUFFICIENCY_GUIDANCE}"
                 ),
                 payload={

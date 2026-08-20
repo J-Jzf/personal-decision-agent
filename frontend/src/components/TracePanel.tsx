@@ -151,7 +151,7 @@ export function TracePanel({ events, status, error, onHitlResponse }: TracePanel
       {targets.length > 0 && <section aria-label="专家信息目标计划" className="trace-plan trace-target-plan">
         <strong>专家信息目标计划</strong>
         <ol>{targets.map((target) => <li key={target.key}>
-          <span className={`task-dot ${target.status === 'complete' ? 'task-dot-completed' : ''}`} />
+          <span className={`task-dot ${target.status === 'complete' ? 'task-dot-completed' : target.status === 'partial' ? 'task-dot-partial' : ''}`} />
           <span className="task-plan-copy">{target.objective}</span><small>{target.status} · {target.calls}/3</small>
         </li>)}</ol>
       </section>}

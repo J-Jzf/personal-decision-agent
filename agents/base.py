@@ -9,7 +9,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.trace_stream import TraceSink, emit_to_sink
-from models.contracts import AgentName, AgentResult, HITLField, HITLRequest, InformationCoverageUpdate, MemoryContext, ObservationRelevance, ReActDecision, TaskSpec, TaskStatus, ToolBindingAssessment, ToolCallStatus, ToolObservation
+from models.contracts import AGENT_EXECUTION_CONTRACTS, AgentName, AgentResult, HITLField, HITLRequest, InformationCoverageUpdate, MemoryContext, ObservationRelevance, ReActDecision, TaskSpec, TaskStatus, ToolBindingAssessment, ToolCallStatus, ToolObservation
 
 
 class ToolAction(BaseModel):
@@ -35,8 +35,10 @@ class AgentContext(BaseModel):
     replan_reason: str | None = None
     information_coverage: dict[str, dict[str, Any]] = Field(default_factory=dict)
     information_targets: list[dict[str, Any]] = Field(default_factory=list)
-    # 以工具观察 ID 索引的可引用资料账本，供纯归纳目标跨目标结算时核验来源。
+    # 以工具观察 ID 索引的可引用资料账本，供总控审计。
     evidence_ledger: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    specialist_delegate: Any = None
+    delegated_results: list[dict[str, Any]] = Field(default_factory=list)
 
     async def trace(self, kind: str, title: str, summary: str, payload: dict[str, Any]) -> None:
         """向所属决策的实时轨迹写入一条可公开展示的行动说明。"""
@@ -70,8 +72,9 @@ class AgentContext(BaseModel):
 
 class BaseReActAgent:
     name = AgentName.EVIDENCE_RESEARCH
+    execution_contract = AGENT_EXECUTION_CONTRACTS[AgentName.EVIDENCE_RESEARCH]
     max_tool_calls = 3
-    max_binding_calls = 3
+    max_binding_calls = 6
 
     async def execute(self, task: TaskSpec, context: AgentContext) -> AgentResult:
         """依次完成专家内部信息目标，每项目标独立拥有三次 MCP 调用额度。"""
@@ -88,6 +91,7 @@ class BaseReActAgent:
             target.setdefault("binding_calls_used", 0)
             target.setdefault("observation_start_index", len(context.observations))
             target_id = str(target["target_id"])
+            self._clear_stale_react_error(context, target_id)
             context.execution_context["active_information_target"] = target
             rounds = 0
             while (
@@ -110,7 +114,7 @@ class BaseReActAgent:
                     if target.get("status") == "complete":
                         break
                     resolution_error = "当前信息目标只能由 Settlement 在所有完成条件满足时结束；请继续补齐当前缺口、请求重规划或请求用户补充。"
-                    context.execution_context["react_validation_error"] = resolution_error
+                    self._set_react_error(context, target_id, resolution_error)
                     context.observations.append(ToolObservation(
                         call_id=str(uuid4()), decision_id=context.decision_id, task_id=task.task_id,
                         target_id=target_id, agent=self.name, tool_name="react_target_resolution",
@@ -141,7 +145,7 @@ class BaseReActAgent:
                 target["binding_calls_used"] += 1
                 if not binding.bound:
                     reason = binding.reason or "工具参数未能绑定到当前信息目标。"
-                    context.execution_context["react_validation_error"] = reason
+                    self._set_react_error(context, target_id, reason)
                     observation = ToolObservation(
                         call_id=str(uuid4()), decision_id=context.decision_id, task_id=task.task_id,
                         target_id=target_id, agent=self.name, tool_name=action.tool_name,
@@ -161,6 +165,7 @@ class BaseReActAgent:
                     {"task_id": task.task_id, "target_id": target_id, "tool": action.tool_name,
                      "binding_calls_used": target["binding_calls_used"], "binding_call_limit": self.max_binding_calls},
                 )
+                self._clear_react_error(context, target_id)
                 await context.trace("react_action", "ReAct 选择下一步行动", "正在为当前信息目标补齐资料。", {"task_id": task.task_id, "target_id": target_id, "agent": self.name.value, "tool": action.tool_name, "arguments": action.arguments})
                 observation = await context.gateway.call_tool(self.name, action.tool_name, action.arguments, decision_id=context.decision_id, task_id=task.task_id, target_id=target_id, trace_sink=context.trace_sink)
                 observation = observation.model_copy(update={"target_id": target_id})
@@ -259,7 +264,12 @@ class BaseReActAgent:
             )
             return False
         status = "complete" if submission.target_complete else "partial"
-        target.update({"status": status, "latest_summary": submission.summary})
+        target.update({
+            "status": status,
+            "latest_summary": submission.summary,
+            "missing_information": list(submission.missing_information),
+            "settlement_criteria": [item.model_dump(mode="json") for item in submission.criteria],
+        })
         changes = context.apply_coverage_updates([InformationCoverageUpdate(
             target_key=target_id, target=str(target.get("objective", target_id)),
             status=status, summary=submission.summary,
@@ -433,8 +443,14 @@ class BaseReActAgent:
                 **context.execution_context, "current_task_history": self._prompt_task_history(task_observations),
                 "coverage": coverage,
             }
-            if context.execution_context.get("react_validation_error"):
-                execution_context["react_validation_error"] = context.execution_context["react_validation_error"]
+            repair = context.execution_context.get("react_validation_error")
+            if isinstance(repair, dict) and repair.get("target_id") == active_target_id:
+                execution_context["react_validation_error"] = str(repair.get("message", ""))
+                # 下一轮已消费该提示；若再次失败会由新错误重新写入。
+                context.execution_context.pop("react_validation_error", None)
+            elif isinstance(repair, str):  # 兼容已有 checkpoint
+                execution_context["react_validation_error"] = repair
+                context.execution_context.pop("react_validation_error", None)
             execution_context["react_context"] = self._react_context_view(
                 task, context, task_observations, coverage,
             )
@@ -485,22 +501,30 @@ class BaseReActAgent:
     async def finish(self, task: TaskSpec, context: AgentContext, used: int) -> AgentResult:
         """按可用资料和剩余缺口结算专家任务，避免局部不足抹掉已取得结论。"""
         successes = [item for item in context.observations if item.task_id == task.task_id and self._is_semantically_usable(item)]
-        failures = [item for item in context.observations if item.task_id == task.task_id and item.status != ToolCallStatus.SUCCEEDED]
+        incomplete_targets = [item for item in context.information_targets if item.get("status") != "complete"]
+        incomplete_ids = {str(item.get("target_id")) for item in incomplete_targets}
+        failures = [
+            item for item in context.observations
+            if item.task_id == task.task_id and item.target_id in incomplete_ids
+            and item.status != ToolCallStatus.SUCCEEDED
+        ]
         uncertainties = [item.error or f"{item.tool_name} 不可用" for item in failures]
         uncertainties.extend(
             item.semantic_summary or f"{item.tool_name} 返回内容未通过当前目标的语义核验"
             for item in context.observations
-            if item.task_id == task.task_id and item.status == ToolCallStatus.SUCCEEDED
+            if item.task_id == task.task_id and item.target_id in incomplete_ids and item.status == ToolCallStatus.SUCCEEDED
             and item.semantic_status in {ObservationRelevance.IRRELEVANT, ObservationRelevance.UNVERIFIABLE}
         )
         if context.replan_reason:
             uncertainties.append(context.replan_reason)
-        incomplete_targets = [item for item in context.information_targets if item.get("status") != "complete"]
         if incomplete_targets:
             uncertainties.extend(f"信息目标未完整覆盖：{item.get('objective', item.get('target_id'))}" for item in incomplete_targets)
             uncertainties.extend(
                 f"信息目标 MCP 调用额度耗尽（上限 {self.max_tool_calls} 次）：{item.get('objective', item.get('target_id'))}"
                 for item in incomplete_targets if item.get("tool_calls_used", 0) >= self.max_tool_calls
+            )
+            uncertainties.extend(
+                missing for item in incomplete_targets for missing in item.get("missing_information", [])
             )
         # 当前目标可用观察与已结算目标摘要共同构成下游可读的任务产出。
         findings = [item.result_summary for item in successes if item.result_summary]
@@ -562,6 +586,23 @@ class BaseReActAgent:
                 "hitl": hitl,
             },
         }
+
+    @staticmethod
+    def _set_react_error(context: AgentContext, target_id: str, message: str) -> None:
+        """只把修正提示交给同一 target 的下一轮 ReAct。"""
+        context.execution_context["react_validation_error"] = {"target_id": target_id, "message": message}
+
+    @staticmethod
+    def _clear_react_error(context: AgentContext, target_id: str) -> None:
+        error = context.execution_context.get("react_validation_error")
+        if isinstance(error, dict) and error.get("target_id") == target_id:
+            context.execution_context.pop("react_validation_error", None)
+
+    @classmethod
+    def _clear_stale_react_error(cls, context: AgentContext, target_id: str) -> None:
+        error = context.execution_context.get("react_validation_error")
+        if isinstance(error, dict) and error.get("target_id") != target_id:
+            context.execution_context.pop("react_validation_error", None)
 
     @staticmethod
     def _is_semantically_usable(observation: ToolObservation) -> bool:

@@ -229,6 +229,25 @@ def test_progress_summary_has_controller_context_after_a_task_completes():
     assert "下一步应该做" in summary
 
 
+def test_replan_context_hides_failures_from_a_completed_target():
+    """已完成 target 的旧失败只用于审计，不能继续被总控当作缺口。"""
+    state = DecisionState(
+        decision_id="d", request=DecisionRequest(query="比较"),
+        plan=ExecutionPlan(tasks=[TaskSpec(task_id="weather", objective="天气", agent=AgentName.LOCATION_LIFESTYLE)]),
+        information_targets={"weather": [{"target_id": "weekend", "status": "complete"}]},
+        tool_observations=[ToolObservation(
+            call_id="bad", decision_id="d", task_id="weather", target_id="weekend",
+            agent=AgentName.LOCATION_LIFESTYLE, tool_name="weather", status=ToolCallStatus.FAILED,
+            error="临时超时",
+        )],
+    )
+
+    context = DecisionGraph._replan_context(state, EvidencePool())
+
+    assert "临时超时" not in context["unmet_gaps"]
+    assert context["failed_tools"] == []
+
+
 def test_replan_without_an_executable_task_is_rejected():
     """重规划不能只输出缺口说明；无任务时应直接转入后续判断。"""
     assert not DecisionGraph.has_executable_replan_tasks([], ["上海 23 日天气缺失"])

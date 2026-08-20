@@ -2,6 +2,8 @@
 
 from .contracts import (
     AgentName,
+    AgentExecutionContract,
+    AGENT_EXECUTION_CONTRACTS,
     AgentResult,
     ContinueRequest,
     DecisionListItem,
@@ -16,10 +18,13 @@ from .contracts import (
     FeedbackRequest,
     FeedbackResponse,
     GeneralTaskResolution,
+    GeneralDelegationPlan,
+    GeneralDelegationRequest,
     MemoryContext,
     ProfileMemory,
     RetrospectiveRequest,
     TaskSpec,
+    TaskWorkKind,
     TaskStatus,
     TargetCriterionSettlement,
     TargetSettlementSubmission,
@@ -32,10 +37,10 @@ from .contracts import (
 )
 
 __all__ = [
-    "AgentName", "AgentResult", "ContinueRequest", "DecisionListItem", "DecisionReport",
+    "AgentName", "AgentExecutionContract", "AGENT_EXECUTION_CONTRACTS", "AgentResult", "ContinueRequest", "DecisionListItem", "DecisionReport",
     "DecisionRequest", "DecisionResponse", "DecisionType", "Episode", "Evidence", "EvidenceStatus",
-    "ExecutionPlan", "FeedbackRequest", "FeedbackResponse", "GeneralTaskResolution", "MemoryContext", "ProfileMemory",
-    "RetrospectiveRequest", "TaskSpec", "TaskStatus", "TargetCriterionSettlement", "TargetSettlementSubmission",
+    "ExecutionPlan", "FeedbackRequest", "FeedbackResponse", "GeneralTaskResolution", "GeneralDelegationPlan", "GeneralDelegationRequest", "MemoryContext", "ProfileMemory",
+    "RetrospectiveRequest", "TaskSpec", "TaskStatus", "TaskWorkKind", "TargetCriterionSettlement", "TargetSettlementSubmission",
     "ToolBindingAssessment", "ToolCallStatus", "ToolDescriptor",
     "ToolObservation", "WorkflowEvent", "WorkflowStatus",
 ]

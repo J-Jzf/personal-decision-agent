@@ -3,11 +3,12 @@
 from uuid import uuid4
 
 from .base import AgentContext, BaseReActAgent
-from models.contracts import AgentName, AgentResult, TaskSpec, TaskStatus
+from models.contracts import AGENT_EXECUTION_CONTRACTS, AgentName, AgentResult, TaskSpec, TaskStatus
 
 
 class PreferenceAgent(BaseReActAgent):
     name = AgentName.PREFERENCE
+    execution_contract = AGENT_EXECUTION_CONTRACTS[name]
 
     async def execute(self, task: TaskSpec, context: AgentContext) -> AgentResult:
         findings = [f"{item.memory_key}={item.value}（置信度 {item.confidence:.2f}）" for item in context.memory.profile_memories]

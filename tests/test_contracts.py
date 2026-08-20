@@ -207,3 +207,16 @@ def test_complete_target_settlement_requires_every_criterion_to_be_satisfied():
             target_complete=True,
             summary="仅有南京天气资料。",
         )
+
+
+def test_task_declares_structured_work_kind_and_target_limits_criteria_to_necessities():
+    """路由必须依据显式工作类型，信息目标最多携带三项必要完成条件。"""
+    from models.contracts import InformationTarget, TaskSpec, TaskWorkKind
+
+    task = TaskSpec(task_id="weather", objective="任意文案", work_kind=TaskWorkKind.LOCATION_RESEARCH)
+    assert task.work_kind is TaskWorkKind.LOCATION_RESEARCH
+
+    with pytest.raises(ValidationError):
+        InformationTarget(
+            target_id="weather", objective="天气", completion_criteria=["a", "b", "c", "d"],
+        )

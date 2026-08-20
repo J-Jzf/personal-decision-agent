@@ -2,42 +2,11 @@
 
 from __future__ import annotations
 
-from models.contracts import AgentName, AutonomousPlan, DecisionRequest, DecisionType, ExecutionPlan, MemoryContext, TaskSpec
+from models.contracts import AGENT_EXECUTION_CONTRACTS, AgentName, AutonomousPlan, DecisionRequest, DecisionType, ExecutionPlan, MemoryContext, TaskSpec, TaskWorkKind
 from skills.registry import SkillDefinition
 
 
-AGENT_EXECUTION_CATALOG: dict[AgentName, dict[str, object]] = {
-    AgentName.EVIDENCE_RESEARCH: {
-        "description": "检索并整理外部网页、地点和事实资料。",
-        "capabilities": {"web_search", "fetch_page", "place_search"},
-        "objective_terms": ("检索", "证据", "网页", "资料", "事实", "研究"),
-    },
-    AgentName.FINANCIAL_MARKET: {
-        "description": "检索和分析市场、价格、持仓或财务数据。",
-        "capabilities": {"web_search", "fetch_page", "market_data"},
-        "objective_terms": ("市场", "金融", "财务", "价格", "股票", "基金", "持仓"),
-    },
-    AgentName.LOCATION_LIFESTYLE: {
-        "description": "检索地点、路线、天气和生活方式资料。",
-        "capabilities": {"web_search", "fetch_page", "place_search", "route_search", "weather_forecast"},
-        "objective_terms": ("地点", "路线", "天气", "通勤", "城市", "旅行", "生活方式"),
-    },
-    AgentName.PREFERENCE: {
-        "description": "仅读取、提取和匹配用户显式偏好与长期记忆。",
-        "capabilities": set(),
-        "objective_terms": ("偏好", "记忆", "画像", "匹配"),
-    },
-    AgentName.RISK_CRITIC: {
-        "description": "检查硬约束、证据缺口、反例和过度结论。",
-        "capabilities": set(),
-        "objective_terms": ("风险", "约束", "反例", "缺口", "审查"),
-    },
-    AgentName.GENERAL: {
-        "description": "一次性执行无专门专家可承担的综合、比较、归纳或推荐任务。",
-        "capabilities": set(),
-        "objective_terms": (),
-    },
-}
+AGENT_EXECUTION_CATALOG = AGENT_EXECUTION_CONTRACTS
 
 
 class Planner:
@@ -69,7 +38,7 @@ class Planner:
         for task in selected.plan.tasks:
             if task.agent not in allowed_agents:
                 continue
-            agent = task.agent if self.agent_can_execute(task.agent, task.objective) else AgentName.GENERAL
+            agent = self.route_agent(task)
             permitted = [
                 capability for capability in task.required_capabilities
                 if capability in available_capabilities and capability in self._capabilities_for_agent(agent)
@@ -89,7 +58,7 @@ class Planner:
             tasks.append(TaskSpec(
                 task_id=identifier, objective=self._objective(agent, request, skill), agent=agent,
                 dependencies=dependencies, required_capabilities=capabilities,
-                completion_criteria=skill.completion_conditions[:3],
+                completion_criteria=skill.completion_conditions[:3], work_kind=self._work_kind(agent),
             ))
             task_ids.append(identifier)
         requires_debate = "risk-debate-moderator" == skill.name or any(term in request.query for term in ("争议", "冲突", "高风险"))
@@ -125,18 +94,24 @@ class Planner:
 
     @staticmethod
     def _capabilities_for_agent(agent: AgentName) -> set[str]:
-        return set(AGENT_EXECUTION_CATALOG.get(agent, {}).get("capabilities", set()))
+        contract = AGENT_EXECUTION_CATALOG.get(agent)
+        return set(contract.capabilities) if contract else set()
 
     @staticmethod
-    def agent_can_execute(agent: AgentName, objective: str) -> bool:
-        """只允许 Planner 将目标分给其真实 execute 行为能够完成的 Agent。"""
-        if agent is AgentName.GENERAL:
-            return True
-        catalog = AGENT_EXECUTION_CATALOG.get(agent)
-        if catalog is None:
-            return False
-        normalized = objective.casefold()
-        return any(term.casefold() in normalized for term in catalog["objective_terms"])
+    def agent_can_execute(agent: AgentName, work_kind: TaskWorkKind,
+                          required_capabilities: list[str] | None = None) -> bool:
+        """只以结构化 execute 合同校验路由，不从 objective 文案猜测职责。"""
+        contract = AGENT_EXECUTION_CATALOG.get(agent)
+        return bool(contract and work_kind in contract.work_kinds and set(required_capabilities or []).issubset(set(contract.capabilities)))
+
+    @classmethod
+    def route_agent(cls, task: TaskSpec) -> AgentName:
+        if cls.agent_can_execute(task.agent, task.work_kind, task.required_capabilities):
+            return task.agent
+        for agent in AGENT_EXECUTION_CATALOG:
+            if cls.agent_can_execute(agent, task.work_kind, task.required_capabilities):
+                return agent
+        return AgentName.GENERAL
 
     @staticmethod
     def _objective(agent: AgentName, request: DecisionRequest, skill: SkillDefinition) -> str:
@@ -150,3 +125,7 @@ class Planner:
             AgentName.GENERAL: "综合已有资料、用户偏好与约束，形成可追溯的比较或推荐",
         }
         return f"{labels[agent]}：{request.query}；维度：{', '.join(skill.analysis_dimensions)}"
+
+    @staticmethod
+    def _work_kind(agent: AgentName) -> TaskWorkKind:
+        return AGENT_EXECUTION_CATALOG[agent].work_kinds[0]

@@ -298,6 +298,49 @@ class DecisionGraph:
                 information_coverage=state.information_coverage,
                 information_targets=state.information_targets.get(task.task_id, []),
             )
+
+            async def specialist_delegate(parent_task: TaskSpec, delegation, parent_context: AgentContext) -> dict[str, Any]:
+                """General 的事实委派：运行真实专家，但不把 MCP 直接暴露给 General。"""
+                factual_agents = {
+                    AgentName.EVIDENCE_RESEARCH, AgentName.FINANCIAL_MARKET, AgentName.LOCATION_LIFESTYLE,
+                }
+                if delegation.agent not in factual_agents:
+                    raise ValueError("general 只能委派给事实检索专家")
+                ordinal = len(parent_context.delegated_results) + 1
+                child_task = TaskSpec(
+                    task_id=f"{parent_task.task_id}.delegate.{delegation.agent.value}.{ordinal}",
+                    objective=delegation.objective, agent=delegation.agent, work_kind=delegation.work_kind,
+                    required_capabilities=delegation.required_capabilities,
+                    completion_criteria=delegation.completion_criteria,
+                )
+                await self._event(
+                    state, "general_delegation_started", "通用 Agent 委派事实专家",
+                    f"general 正在委派 {delegation.agent.value} 补齐必要外部事实。",
+                    {"parent_task_id": parent_task.task_id, "delegated_task": child_task.model_dump(mode="json")}, publisher,
+                )
+                child_context = AgentContext(
+                    decision_id=state.decision_id, gateway=self.gateway, memory=state.memory,
+                    evidence_pool=pool, request_context=context.request_context, trace_sink=trace_sink,
+                    model_adapter=self.judge.model_adapter, request=state.request,
+                    available_tools=[item for item in self.gateway.registry.list_capabilities() if delegation.agent in item.allowed_agents],
+                    execution_context=self._react_execution_context(state, child_task, pool),
+                    information_coverage=state.information_coverage,
+                )
+                result = await self.agents[delegation.agent].execute(child_task, child_context)
+                state.information_targets[child_task.task_id] = child_context.information_targets
+                parent_context.observations.extend(child_context.observations)
+                parent_context.information_coverage = child_context.information_coverage
+                parent_context.execution_context.setdefault("delegated_task_specs", {})[child_task.task_id] = child_task.model_dump(mode="json")
+                await self._event(
+                    state, "general_delegation_completed", "事实专家委派完成", result.summary,
+                    {"parent_task_id": parent_task.task_id, "delegated_task_id": child_task.task_id,
+                     "agent": delegation.agent.value, "findings": result.findings,
+                     "uncertainties": result.uncertainties, "completion_status": result.completion_status.value}, publisher,
+                )
+                return result.model_dump(mode="json")
+
+            if task.agent == AgentName.GENERAL:
+                context.specialist_delegate = specialist_delegate
             async def human_input_handler(hitl: HITLRequest) -> None:
                 """暂停当前专家并把可选字段、跳过或超时结果写回同一决策上下文。"""
                 resolved = await self._wait_for_human_input(state, hitl, publisher)
@@ -404,7 +447,7 @@ class DecisionGraph:
             evidence_id=f"EV-{uuid4().hex[:12]}", decision_id=state.decision_id,
             claim=self._evidence_claim(task, state, observation.target_id), scope_key=scope_key,
             value=observation.result_summary, source=f"mcp:{observation.tool_name}", source_type="external_tool",
-            agent=task.agent, tool=observation.tool_name, confidence=.65,
+            agent=observation.agent, tool=observation.tool_name, confidence=.65,
             status=EvidenceStatus.UNVERIFIED,
         )
         related = pool.in_scope(scope_key)
@@ -484,6 +527,16 @@ class DecisionGraph:
         )
 
     @staticmethod
+    def _observation_target_is_unresolved(state: DecisionState, observation) -> bool:
+        """已 complete target 的历史失败只保留审计轨迹，不再伪装成总控缺口。"""
+        if not observation.target_id:
+            return True
+        for target in state.information_targets.get(observation.task_id, []):
+            if target.get("target_id") == observation.target_id:
+                return target.get("status") != "complete"
+        return True
+
+    @staticmethod
     def incremental_replan_tasks(state: DecisionState, replacement: ExecutionPlan) -> tuple[list[TaskSpec], list[str]]:
         """去除已完成任务及其依赖，确保重规划只执行尚未满足的分析缺口。"""
         # completed_with_gaps 已有可综合资料，重规划不能把它当成完全未执行而反复运行。
@@ -513,7 +566,7 @@ class DecisionGraph:
             if result.completion_status != TaskStatus.COMPLETED:
                 unmet_gaps.extend(result.uncertainties or [f"任务 {result.task_id} 未完成"])
         for observation in state.tool_observations:
-            if observation.status != ToolCallStatus.SUCCEEDED and observation.error:
+            if observation.status != ToolCallStatus.SUCCEEDED and observation.error and DecisionGraph._observation_target_is_unresolved(state, observation):
                 unmet_gaps.append(observation.error)
         # 证据账本保留可引用的跨目标资料；正式 Evidence 仍只收录直接支撑其所属目标的观察。
         return {
@@ -545,6 +598,7 @@ class DecisionGraph:
                 }
                 for observation in state.tool_observations
                 if not DecisionGraph._observation_is_referenceable(observation)
+                and DecisionGraph._observation_target_is_unresolved(state, observation)
             ],
             "unmet_gaps": list(dict.fromkeys(item for item in unmet_gaps if item)),
             "task_statuses": list(state.task_ledger.values()),

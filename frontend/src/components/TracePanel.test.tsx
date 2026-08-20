@@ -41,4 +41,13 @@ describe('TracePanel', () => {
 
     expect(screen.getByText('complete · 0/3')).toBeTruthy()
   })
+
+  it('renders a partial target as a half-filled status circle', () => {
+    const { container } = render(<TracePanel status="running" events={[
+      { event_id: '1', decision_id: 'd-1', to_state: 'executing', kind: 'expert_information_plan', title: '专家信息目标计划', summary: '', sequence: 1, payload: { task_id: 'weather', targets: [{ target_id: 'comparison', objective: '比较两地天气', status: 'pending', tool_calls_used: 0 }] }, created_at: '2026-08-18T00:00:00Z' },
+      { event_id: '2', decision_id: 'd-1', to_state: 'executing', kind: 'information_coverage_updated', title: '已更新当前信息目标覆盖状态', summary: '', sequence: 2, payload: { task_id: 'weather', updates: [{ target_key: 'comparison', status: 'partial' }] }, created_at: '2026-08-18T00:00:01Z' },
+    ]} />)
+
+    expect(container.querySelector('.task-dot-partial')).toBeTruthy()
+  })
 })

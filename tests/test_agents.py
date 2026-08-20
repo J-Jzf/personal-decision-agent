@@ -568,3 +568,63 @@ def test_partial_settlement_keeps_the_same_target_active_until_a_full_settlement
     assert gateway.calls == 2
     assert adapter.settlement_calls == 2
     assert context.information_targets[0]["status"] == "complete"
+    assert context.information_targets[0]["missing_information"] == []
+    assert len(context.information_targets[0]["settlement_criteria"]) == 2
+
+
+def test_react_repair_message_is_consumed_once_for_its_own_target():
+    """预检修正原因只服务同一 target 的下一轮，不得残留到后续 target。"""
+    from models.contracts import ReActDecision, TaskSpec
+
+    class Adapter:
+        def __init__(self): self.messages = []
+        async def react_or_fallback(self, **kwargs):
+            self.messages.append(kwargs["execution_context"].get("react_validation_error"))
+            return ReActDecision(action="request_replan", public_summary="停止")
+
+    adapter = Adapter()
+    context = AgentContext(
+        decision_id="d", memory=MemoryContext(), model_adapter=adapter,
+        request=DecisionRequest(query="测试"),
+        execution_context={
+            "active_information_target": {"target_id": "suzhou", "objective": "苏州天气", "completion_criteria": ["天气"]},
+            "react_validation_error": {"target_id": "suzhou", "message": "城市参数不匹配"},
+        },
+    )
+    task = TaskSpec(task_id="weather", objective="查询天气", agent=AgentName.EVIDENCE_RESEARCH)
+
+    asyncio.run(BaseReActAgent()._decide(task, context, 3))
+
+    assert adapter.messages == ["城市参数不匹配"]
+    assert "react_validation_error" not in context.execution_context
+
+
+def test_general_agent_delegates_factual_work_then_synthesizes_results():
+    """General 不直连 MCP，而是消费受限事实专家的委派结果再综合。"""
+    from agents.general import GeneralAgent
+    from models.contracts import GeneralDelegationPlan, GeneralDelegationRequest, GeneralTaskResolution, TaskSpec
+
+    class Adapter:
+        async def plan_general_delegations_or_fallback(self, **kwargs):
+            return GeneralDelegationPlan(reason="缺少天气事实", delegations=[GeneralDelegationRequest(
+                agent=AgentName.LOCATION_LIFESTYLE, work_kind="location_research",
+                objective="查询苏州天气", completion_criteria=["周末天气"],
+            )])
+        async def resolve_general_task_or_fallback(self, **kwargs):
+            assert kwargs["execution_context"]["delegated_results"][0]["findings"] == ["苏州周末晴"]
+            return GeneralTaskResolution(summary="推荐苏州", findings=["综合结论"], uncertainties=[], completion_status="completed")
+
+    async def delegate(parent, request, context):
+        assert parent.agent is AgentName.GENERAL
+        assert request.agent is AgentName.LOCATION_LIFESTYLE
+        return {"findings": ["苏州周末晴"], "uncertainties": []}
+
+    context = AgentContext(
+        decision_id="d", memory=MemoryContext(), model_adapter=Adapter(), request=DecisionRequest(query="去哪里"),
+        specialist_delegate=delegate,
+    )
+    result = asyncio.run(GeneralAgent().execute(TaskSpec(
+        task_id="synthesis", objective="推荐目的地", agent=AgentName.GENERAL, work_kind="synthesis",
+    ), context))
+
+    assert result.findings == ["苏州周末晴", "综合结论"]

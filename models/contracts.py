@@ -77,6 +77,38 @@ class AgentName(str, Enum):
     GENERAL = "general"
 
 
+class TaskWorkKind(str, Enum):
+    """Planner 用于校验任务与真实执行器是否匹配的显式工作类型。"""
+
+    EXTERNAL_RESEARCH = "external_research"
+    FINANCIAL_ANALYSIS = "financial_analysis"
+    LOCATION_RESEARCH = "location_research"
+    PREFERENCE_MATCHING = "preference_matching"
+    SYNTHESIS = "synthesis"
+    RISK_REVIEW = "risk_review"
+
+
+class AgentExecutionContract(BaseModel):
+    """Planner 与 Agent 共用的、可机读的 execute() 职责合同。"""
+
+    agent: AgentName
+    work_kinds: list[TaskWorkKind] = Field(min_length=1)
+    capabilities: list[str] = Field(default_factory=list)
+    may_delegate: bool = False
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+AGENT_EXECUTION_CONTRACTS: dict[AgentName, AgentExecutionContract] = {
+    AgentName.EVIDENCE_RESEARCH: AgentExecutionContract(agent=AgentName.EVIDENCE_RESEARCH, work_kinds=[TaskWorkKind.EXTERNAL_RESEARCH], capabilities=["web_search", "fetch_page", "place_search"]),
+    AgentName.FINANCIAL_MARKET: AgentExecutionContract(agent=AgentName.FINANCIAL_MARKET, work_kinds=[TaskWorkKind.FINANCIAL_ANALYSIS], capabilities=["web_search", "fetch_page", "market_data"]),
+    AgentName.LOCATION_LIFESTYLE: AgentExecutionContract(agent=AgentName.LOCATION_LIFESTYLE, work_kinds=[TaskWorkKind.LOCATION_RESEARCH], capabilities=["web_search", "fetch_page", "place_search", "route_search", "weather_forecast"]),
+    AgentName.PREFERENCE: AgentExecutionContract(agent=AgentName.PREFERENCE, work_kinds=[TaskWorkKind.PREFERENCE_MATCHING]),
+    AgentName.RISK_CRITIC: AgentExecutionContract(agent=AgentName.RISK_CRITIC, work_kinds=[TaskWorkKind.RISK_REVIEW]),
+    AgentName.GENERAL: AgentExecutionContract(agent=AgentName.GENERAL, work_kinds=[TaskWorkKind.SYNTHESIS], may_delegate=True),
+}
+
+
 class ToolCallStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -118,6 +150,7 @@ class TaskSpec(ContractModel):
     task_id: str = Field(min_length=1)
     objective: str = Field(min_length=1)
     agent: AgentName = AgentName.EVIDENCE_RESEARCH
+    work_kind: TaskWorkKind = TaskWorkKind.EXTERNAL_RESEARCH
     dependencies: list[str] = Field(default_factory=list)
     required_capabilities: list[str] = Field(default_factory=list)
     completion_criteria: list[str] = Field(default_factory=list)
@@ -250,10 +283,12 @@ class InformationTarget(ContractModel):
 
     target_id: str = Field(min_length=1, max_length=120, pattern=r"^[a-z0-9][a-z0-9._:-]*$")
     objective: str = Field(min_length=1, max_length=300)
-    completion_criteria: list[str] = Field(default_factory=list, max_length=6)
+    completion_criteria: list[str] = Field(default_factory=list, max_length=3)
     status: Literal["pending", "partial", "complete", "blocked"] = "pending"
     tool_calls_used: int = Field(default=0, ge=0, le=3)
     latest_summary: str | None = Field(default=None, max_length=1000)
+    missing_information: list[str] = Field(default_factory=list, max_length=8)
+    settlement_criteria: list[dict[str, Any]] = Field(default_factory=list, max_length=3)
 
 
 class ExpertInformationPlan(ContractModel):
@@ -347,6 +382,27 @@ class GeneralTaskResolution(ContractModel):
     findings: list[str] = Field(default_factory=list, max_length=12)
     uncertainties: list[str] = Field(default_factory=list, max_length=8)
     completion_status: Literal["completed", "completed_with_gaps", "blocked"]
+
+
+class GeneralDelegationRequest(ContractModel):
+    """General 只能委派给有 MCP 检索职责的事实专家。"""
+
+    agent: Literal[AgentName.EVIDENCE_RESEARCH, AgentName.FINANCIAL_MARKET, AgentName.LOCATION_LIFESTYLE]
+    work_kind: Literal[
+        TaskWorkKind.EXTERNAL_RESEARCH,
+        TaskWorkKind.FINANCIAL_ANALYSIS,
+        TaskWorkKind.LOCATION_RESEARCH,
+    ]
+    objective: str = Field(min_length=1, max_length=500)
+    required_capabilities: list[str] = Field(default_factory=list, max_length=6)
+    completion_criteria: list[str] = Field(default_factory=list, max_length=3)
+
+
+class GeneralDelegationPlan(ContractModel):
+    """General 在最终综合前请求的有界事实委派。"""
+
+    reason: str = Field(min_length=1, max_length=800)
+    delegations: list[GeneralDelegationRequest] = Field(default_factory=list, max_length=3)
 
 
 class ProfileSignalExtraction(ContractModel):

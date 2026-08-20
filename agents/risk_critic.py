@@ -5,7 +5,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from .base import AgentContext, BaseReActAgent
-from models.contracts import AgentName, AgentResult, EvidenceStatus, TaskSpec, TaskStatus
+from models.contracts import AGENT_EXECUTION_CONTRACTS, AgentName, AgentResult, EvidenceStatus, TaskSpec, TaskStatus
 
 
 class CriticReview(BaseModel):
@@ -20,6 +20,7 @@ class CriticReview(BaseModel):
 
 class RiskCritic(BaseReActAgent):
     name = AgentName.RISK_CRITIC
+    execution_contract = AGENT_EXECUTION_CONTRACTS[name]
 
     def review(self, constraints: list[str], context: AgentContext) -> CriticReview:
         evidence = context.evidence_pool.list() if context.evidence_pool is not None else []
