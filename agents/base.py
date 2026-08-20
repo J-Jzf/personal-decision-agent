@@ -9,7 +9,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.trace_stream import TraceSink, emit_to_sink
-from models.contracts import AgentName, AgentResult, HITLField, HITLRequest, InformationCoverageUpdate, MemoryContext, ObservationRelevance, ReActDecision, TaskSpec, TaskStatus, ToolCallStatus, ToolObservation
+from models.contracts import AgentName, AgentResult, HITLField, HITLRequest, InformationCoverageUpdate, MemoryContext, ObservationRelevance, ReActDecision, TaskSpec, TaskStatus, ToolBindingAssessment, ToolCallStatus, ToolObservation
 
 
 class ToolAction(BaseModel):
@@ -71,6 +71,7 @@ class AgentContext(BaseModel):
 class BaseReActAgent:
     name = AgentName.EVIDENCE_RESEARCH
     max_tool_calls = 3
+    max_binding_calls = 3
 
     async def execute(self, task: TaskSpec, context: AgentContext) -> AgentResult:
         """依次完成专家内部信息目标，每项目标独立拥有三次 MCP 调用额度。"""
@@ -84,11 +85,17 @@ class BaseReActAgent:
                 continue
             target.setdefault("status", "pending")
             target.setdefault("tool_calls_used", 0)
+            target.setdefault("binding_calls_used", 0)
             target.setdefault("observation_start_index", len(context.observations))
             target_id = str(target["target_id"])
             context.execution_context["active_information_target"] = target
             rounds = 0
-            while context.gateway is not None and target["tool_calls_used"] < self.max_tool_calls and rounds < self.max_tool_calls * 2:
+            while (
+                context.gateway is not None
+                and target["tool_calls_used"] < self.max_tool_calls
+                and target["binding_calls_used"] < self.max_binding_calls
+                and rounds < (self.max_tool_calls + self.max_binding_calls) * 2
+            ):
                 rounds += 1
                 decision = await self._decide(task, context, self.max_tool_calls - target["tool_calls_used"])
                 has_usable_observation = any(
@@ -98,24 +105,22 @@ class BaseReActAgent:
                 # 状态账本优先于模型下一动作：已完成目标绝不能继续消耗自己的额度或承接另一目标的查询。
                 if target.get("status") == "complete":
                     break
-                # finish 是当前信息目标的结算动作；它不是整个专家任务的立即退出。
+                # 当前目标只能由 Settlement 的 target_complete 结束，ReAct 不能自行以 partial/blocked 结算。
                 if decision.action == "finish":
-                    resolution_error = await self._apply_target_resolution(
-                        task, context, target, decision, has_usable_observation,
+                    if target.get("status") == "complete":
+                        break
+                    resolution_error = "当前信息目标只能由 Settlement 在所有完成条件满足时结束；请继续补齐当前缺口、请求重规划或请求用户补充。"
+                    context.execution_context["react_validation_error"] = resolution_error
+                    context.observations.append(ToolObservation(
+                        call_id=str(uuid4()), decision_id=context.decision_id, task_id=task.task_id,
+                        target_id=target_id, agent=self.name, tool_name="react_target_resolution",
+                        status=ToolCallStatus.FAILED, error=resolution_error,
+                    ))
+                    await context.trace(
+                        "react_resolution_repair", "专家目标结算正在修正", resolution_error,
+                        {"task_id": task.task_id, "target_id": target_id, "validation_error": resolution_error},
                     )
-                    if resolution_error:
-                        context.execution_context["react_validation_error"] = resolution_error
-                        context.observations.append(ToolObservation(
-                            call_id=str(uuid4()), decision_id=context.decision_id, task_id=task.task_id,
-                            agent=self.name, tool_name="react_target_resolution", status=ToolCallStatus.FAILED,
-                            error=resolution_error,
-                        ))
-                        await context.trace(
-                            "react_resolution_repair", "专家目标结算正在修正", resolution_error,
-                            {"task_id": task.task_id, "target_id": target_id, "validation_error": resolution_error},
-                        )
-                        continue
-                    break
+                    continue
                 if decision.action == "request_replan":
                     context.replan_reason = decision.public_summary
                     await context.trace("react_replan", "专家请求重新规划", decision.public_summary, {"task_id": task.task_id, "agent": self.name.value})
@@ -132,6 +137,30 @@ class BaseReActAgent:
                 if action_key in attempted_actions and attempted_actions[action_key] != ToolCallStatus.SUCCEEDED:
                     context.observations.append(ToolObservation(call_id=str(uuid4()), decision_id=context.decision_id, task_id=task.task_id, agent=self.name, tool_name=action.tool_name, arguments=action.arguments, status=ToolCallStatus.FAILED, error="重复工具调用已阻止：请改用不同的工具或参数、请求重新规划，或结束当前目标。"))
                     continue
+                binding = await self._assess_tool_binding(task, context, target, action)
+                target["binding_calls_used"] += 1
+                if not binding.bound:
+                    reason = binding.reason or "工具参数未能绑定到当前信息目标。"
+                    context.execution_context["react_validation_error"] = reason
+                    observation = ToolObservation(
+                        call_id=str(uuid4()), decision_id=context.decision_id, task_id=task.task_id,
+                        target_id=target_id, agent=self.name, tool_name=action.tool_name,
+                        arguments=action.arguments, status=ToolCallStatus.FAILED, error=reason,
+                    )
+                    context.observations.append(observation)
+                    attempted_actions[action_key] = observation.status
+                    await context.trace(
+                        "tool_binding_rejected", "工具参数未绑定当前信息目标", reason,
+                        {"task_id": task.task_id, "target_id": target_id, "tool": action.tool_name,
+                         "arguments": action.arguments, "binding_calls_used": target["binding_calls_used"],
+                         "binding_call_limit": self.max_binding_calls},
+                    )
+                    continue
+                await context.trace(
+                    "tool_binding_accepted", "工具参数已绑定当前信息目标", "调用前语义预检通过，准备调用 MCP。",
+                    {"task_id": task.task_id, "target_id": target_id, "tool": action.tool_name,
+                     "binding_calls_used": target["binding_calls_used"], "binding_call_limit": self.max_binding_calls},
+                )
                 await context.trace("react_action", "ReAct 选择下一步行动", "正在为当前信息目标补齐资料。", {"task_id": task.task_id, "target_id": target_id, "agent": self.name.value, "tool": action.tool_name, "arguments": action.arguments})
                 observation = await context.gateway.call_tool(self.name, action.tool_name, action.arguments, decision_id=context.decision_id, task_id=task.task_id, target_id=target_id, trace_sink=context.trace_sink)
                 observation = observation.model_copy(update={"target_id": target_id})
@@ -150,29 +179,58 @@ class BaseReActAgent:
                     if target_was_settled or target.get("status") == "complete":
                         break
             if target.get("status") not in {"complete", "partial", "blocked"}:
-                exhausted = target["tool_calls_used"] >= self.max_tool_calls
+                exhausted = target["tool_calls_used"] >= self.max_tool_calls or target["binding_calls_used"] >= self.max_binding_calls
                 target.update({
                     "status": "blocked",
                     "latest_summary": target.get("latest_summary") or (
-                        "该信息目标的 MCP 调用额度已耗尽。" if exhausted else "专家未在现有资料下完成该信息目标。"
+                        "该信息目标的 MCP 或预检调用额度已耗尽。" if exhausted else "专家未在现有资料下完成该信息目标。"
                     ),
                 })
                 await context.trace("information_target_status", "信息目标已阻塞", "该目标未达到完成条件，已保留现有资料与缺口。", {"task_id": task.task_id, "target_id": target_id, "status": "blocked", "tool_calls_used": target["tool_calls_used"], "latest_summary": target["latest_summary"]})
         return await self.finish(task, context, used)
 
+    async def _assess_tool_binding(self, task: TaskSpec, context: AgentContext,
+                                   target: dict[str, Any], action: ToolAction) -> ToolBindingAssessment:
+        """在任何 MCP 调用前，以当前目标为唯一语义范围验证工具参数。"""
+        assessor = getattr(context.model_adapter, "assess_tool_binding_or_fallback", None)
+        if not callable(assessor) or context.request is None:
+            # 兼容不含模型的本地单元测试；实际 ModelAdapter 在离线时会保守拒绝。
+            return ToolBindingAssessment(bound=True)
+        selected_tool: dict[str, Any] = {"name": action.tool_name}
+        for item in context.available_tools:
+            raw = item.model_dump(mode="json") if hasattr(item, "model_dump") else item
+            if isinstance(raw, dict) and raw.get("name") == action.tool_name:
+                selected_tool = {
+                    "name": raw.get("name"), "description": raw.get("description", ""),
+                    "input_schema": raw.get("input_schema", {}),
+                }
+                break
+        await context.trace(
+            "tool_binding_requested", "正在预检工具参数", "调用 MCP 前正在确认参数是否服务当前信息目标。",
+            {"task_id": task.task_id, "target_id": target.get("target_id"), "tool": action.tool_name,
+             "arguments": action.arguments},
+        )
+        return await assessor(
+            request=context.request, task=task, target={
+                key: target[key] for key in ("target_id", "objective", "completion_criteria", "status", "latest_summary")
+                if key in target
+            },
+            tool=selected_tool, arguments=action.arguments,
+        )
+
     async def _settle_current_target_after_observation(self, task: TaskSpec, context: AgentContext,
                                                         target: dict[str, Any], observation: ToolObservation) -> bool:
-        """在语义可用观察落账后立即委托专用 LLM 结算当前子目标，不等待下一轮 ReAct。"""
+        """仅用当前目标已支持的观察逐条件结算；partial 必须继续 ReAct。"""
         submit = getattr(context.model_adapter, "settle_current_target_after_observation_or_none", None)
         target_id = str(target["target_id"])
         if not callable(submit):
             return False
         current_target = {
-            key: target[key] for key in ("target_id", "objective", "status", "latest_summary") if key in target
+            key: target[key] for key in ("target_id", "objective", "completion_criteria", "status", "latest_summary") if key in target
         }
         target_observations = [
             item.model_dump(mode="json") for item in context.observations
-            if item.target_id == target_id and item.result_summary
+            if item.target_id == target_id and item.result_summary and self._is_semantically_usable(item)
         ]
         await context.trace(
             "target_settlement_requested", "正在结算信息目标",
@@ -180,7 +238,7 @@ class BaseReActAgent:
             {"task_id": task.task_id, "target_id": target_id},
         )
         submission = await submit(
-            current_target=current_target, tool_observation=observation.model_dump(mode="json"),
+            current_target=current_target,
             target_observations=target_observations,
             existing_coverage=context.information_coverage.get(target_id, {}),
         )
@@ -191,48 +249,36 @@ class BaseReActAgent:
                 {"task_id": task.task_id, "target_id": target_id},
             )
             return False
-        updates = [item for item in submission.coverage_updates if item.target_key == target_id]
-        resolution = submission.target_resolution
-        if not updates and (resolution is None or resolution.target_id != target_id):
+        expected_criteria = list(target.get("completion_criteria", task.completion_criteria))
+        returned_criteria = [item.criterion for item in submission.criteria]
+        if expected_criteria and set(returned_criteria) != set(expected_criteria):
             await context.trace(
                 "target_settlement_failed", "信息目标结算无效",
-                "结算内容没有更新当前信息目标；将保留当前资料并继续既有执行。",
+                "结算内容没有逐项覆盖当前信息目标的完成条件；将保留当前资料并继续既有执行。",
                 {"task_id": task.task_id, "target_id": target_id},
             )
             return False
-        if updates and resolution is not None and (
-            resolution.status == "blocked" or any(item.status != resolution.status for item in updates)
-        ):
-            await context.trace(
-                "target_settlement_failed", "信息目标结算冲突",
-                "覆盖更新与结束结算的状态不一致；将保留当前资料并继续既有执行。",
-                {"task_id": task.task_id, "target_id": target_id},
-            )
-            return False
-        changes = context.apply_coverage_updates(updates)
-        if changes:
-            target.update({"status": changes[-1]["status"], "latest_summary": changes[-1]["latest_summary"]})
-            await context.trace(
-                "information_coverage_updated", "已更新信息覆盖状态", "专用结算节点已更新当前信息目标的部分或完整状态。",
-                {"task_id": task.task_id, "target_id": target_id, "updates": changes},
-            )
-        if resolution is not None:
-            resolution_decision = ReActDecision(
-                action="finish", public_summary="专用结算节点已结束当前信息目标。", target_resolution=resolution,
-            )
-            resolution_error = await self._apply_target_resolution(task, context, target, resolution_decision, True)
-            if resolution_error:
-                await context.trace(
-                    "target_settlement_failed", "信息目标结束结算无效", resolution_error,
-                    {"task_id": task.task_id, "target_id": target_id},
-                )
-                return False
+        status = "complete" if submission.target_complete else "partial"
+        target.update({"status": status, "latest_summary": submission.summary})
+        changes = context.apply_coverage_updates([InformationCoverageUpdate(
+            target_key=target_id, target=str(target.get("objective", target_id)),
+            status=status, summary=submission.summary,
+        )])
+        await context.trace(
+            "information_coverage_updated", "已更新当前信息目标覆盖状态",
+            "专用结算节点已逐项评估当前目标完成条件。",
+            {"task_id": task.task_id, "target_id": target_id, "updates": changes,
+             "criteria": [item.model_dump(mode="json") for item in submission.criteria],
+             "missing_information": submission.missing_information,
+             "target_complete": submission.target_complete},
+        )
         await context.trace(
             "target_settlement_applied", "已结算信息目标",
-            "已从专用结算 JSON 提取覆盖更新和结束结算，并立即写入当前目标状态账本。",
-            {"task_id": task.task_id, "target_id": target_id, "coverage_update_count": len(updates), "has_target_resolution": resolution is not None},
+            "目标仅在所有完成条件满足时提前结束；partial 会回到 ReAct 补齐资料。",
+            {"task_id": task.task_id, "target_id": target_id,
+             "coverage_status": submission.coverage_status, "target_complete": submission.target_complete},
         )
-        return resolution is not None or target.get("status") == "complete"
+        return submission.target_complete
 
     async def _ensure_information_targets(self, task: TaskSpec, context: AgentContext) -> None:
         """仅在没有已持久化目标时让模型生成专家内部计划，并立即发出前端可见轨迹。"""
@@ -276,13 +322,13 @@ class BaseReActAgent:
             })
         assessment = await context.model_adapter.assess_observation_or_fallback(
             request=context.request, task=task, target=target, observation=observation,
-            known_targets=context.information_targets,
         )
         return observation.model_copy(update={
             "semantic_status": assessment.relevance,
             "semantic_summary": assessment.summary,
             "semantic_missing_information": assessment.missing_information,
             "supports_current_target": assessment.supports_current_target,
+            "coverage_contribution": assessment.coverage_contribution,
             "related_target_ids": assessment.related_target_ids,
         })
 
@@ -362,13 +408,19 @@ class BaseReActAgent:
     async def _decide(self, task: TaskSpec, context: AgentContext, remaining_calls: int) -> ReActDecision:
         """模型可用时让专家自主选择下一步；本地规则仅作为离线回退。"""
         if context.model_adapter is not None and context.request is not None:
-            previous_task_history = list(context.execution_context.get("current_task_history", []))
+            active_target = context.execution_context.get("active_information_target", {})
+            active_target_id = active_target.get("target_id") if isinstance(active_target, dict) else None
+            previous_task_history = [
+                item for item in context.execution_context.get("current_task_history", [])
+                if not isinstance(item, dict) or item.get("target_id") in {None, active_target_id}
+            ]
             current_task_observations = [
-                item.model_dump(mode="json") for item in context.observations if item.task_id == task.task_id
+                item.model_dump(mode="json") for item in context.observations
+                if item.task_id == task.task_id and item.target_id == active_target_id
             ]
             task_observations = [*previous_task_history, *current_task_observations]
             coverage = dict(context.execution_context.get("coverage", {}))
-            coverage["current_completion_criteria"] = task.completion_criteria
+            coverage["current_completion_criteria"] = list(active_target.get("completion_criteria", task.completion_criteria))
             coverage["current_successful_results"] = [
                 item["result_summary"] for item in task_observations
                 if self._observation_dict_is_usable(item) and item.get("result_summary")
@@ -390,6 +442,7 @@ class BaseReActAgent:
                 task=task, request=context.request, memory=context.memory,
                 observations=task_observations,
                 tools=context.available_tools, remaining_calls=remaining_calls,
+                remaining_binding_calls=max(0, self.max_binding_calls - int(active_target.get("binding_calls_used", 0))),
                 execution_context=execution_context,
             )
         action = await self.next_action(task, context)
@@ -482,51 +535,33 @@ class BaseReActAgent:
     @staticmethod
     def _react_context_view(task: TaskSpec, context: AgentContext,
                             task_observations: list[dict[str, Any]], coverage: dict[str, Any]) -> dict[str, Any]:
-        """以固定中文字段构造每轮专家可读的公开工作上下文，不包含隐藏思维链。"""
+        """构造严格限于当前信息目标的 ReAct 公开上下文。"""
         prompt_history = BaseReActAgent._prompt_task_history(task_observations)
-        successes = [
-            item.get("result_summary") for item in task_observations
-            if BaseReActAgent._observation_dict_is_usable(item) and item.get("result_summary")
-        ]
-        last = task_observations[-1] if task_observations else None
-        last_step: dict[str, Any] | str = "这是当前任务的第一轮，尚未调用工具。"
-        if last is not None:
-            last_step = {
-                "工具指令": {"tool_name": last.get("tool_name"), "arguments": last.get("arguments", {})},
-                "结果": last.get("result_summary") or last.get("error") or "工具未返回可用内容",
-                "状态": last.get("status"),
-            }
-        completed_tasks = context.execution_context.get("completed_tasks", [])
-        all_tasks = context.execution_context.get("all_tasks", [])
+        active_target = dict(context.execution_context.get("active_information_target", {}))
+        target_id = active_target.get("target_id")
+        target_coverage = context.information_coverage.get(target_id, {}) if target_id else {}
+        missing = list(active_target.get("missing_information", []))
+        if not missing:
+            missing = list(coverage.get("current_missing_information", []))
+        if not missing:
+            missing = list(active_target.get("completion_criteria", task.completion_criteria))
         hitl = context.request.context.get("hitl", {}) if context.request is not None else {}
-        view = {
+        return {
             "用户问题": context.request.query if context.request is not None else "",
-            "为完成这一问题计划的全部任务有": all_tasks,
-            "目前已完成的任务有": completed_tasks,
-            "当前在完成": task.model_dump(mode="json"),
-            "当前信息目标": context.execution_context.get("active_information_target", {}),
-            "专家信息目标计划": context.information_targets,
-            "当前任务成功的条件是得到": task.completion_criteria,
-            "当前任务本轮执行期间此前的全部工具调用": prompt_history,
-            "成功摘要": successes,
-            "已经获得的所有信息结果": context.execution_context.get("all_successful_information", []),
-            "跨任务和重规划继承的结构化覆盖状态": context.execution_context.get("structured_coverage", {}),
-            "信息目标覆盖账本": context.information_coverage,
-            "可引用证据账本": context.execution_context.get("evidence_ledger", list(context.evidence_ledger.values())),
-            "任务状态账本": context.execution_context.get("task_statuses", []),
-            "当前任务还需关注": [
-                *[f"确认是否满足：{criterion}" for criterion in task.completion_criteria],
-                *coverage.get("current_missing_information", []),
-            ],
-            "当前任务的上一步做了": last_step,
+            "Task": {"task_id": task.task_id, "objective": task.objective},
+            "当前 target": active_target,
+            "当前 target completion_criteria": list(active_target.get("completion_criteria", task.completion_criteria)),
+            "当前 target 已有 observations": prompt_history,
+            "当前 target latest_summary": active_target.get("latest_summary"),
+            "当前 target coverage": target_coverage,
+            "当前 target missing_information": missing,
+            "当前 target 剩余 MCP 调用次数": max(0, BaseReActAgent.max_tool_calls - int(active_target.get("tool_calls_used", 0))),
+            "当前 target 剩余预检次数": max(0, BaseReActAgent.max_binding_calls - int(active_target.get("binding_calls_used", 0))),
             "相关记忆与 HITL 补充": {
                 "memory": context.memory.model_dump(mode="json"),
                 "hitl": hitl,
             },
         }
-        if last is not None and last.get("status") != ToolCallStatus.SUCCEEDED.value and last.get("error"):
-            view["上一轮失败原因"] = last["error"]
-        return view
 
     @staticmethod
     def _is_semantically_usable(observation: ToolObservation) -> bool:
@@ -536,7 +571,7 @@ class BaseReActAgent:
     @staticmethod
     def _should_settle_observation(observation: ToolObservation) -> bool:
         """按结算节点合同识别触发观察：仅要求工具成功且语义核验为相关或部分相关。"""
-        return observation.status == ToolCallStatus.SUCCEEDED and observation.semantic_status in {
+        return observation.supports_current_target and observation.status == ToolCallStatus.SUCCEEDED and observation.semantic_status in {
             ObservationRelevance.RELEVANT, ObservationRelevance.PARTIAL,
         }
 

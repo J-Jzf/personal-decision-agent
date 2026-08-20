@@ -167,13 +167,29 @@ class TargetSettlementCompletions:
 
     async def create(self, **kwargs):
         self.calls.append(kwargs)
-        content = '''{"coverage_updates":[{"target_key":"weather-primary","target":"获取周末天气","status":"complete","summary":"已取得足以参考的天气资料。"}],"target_resolution":null}'''
+        content = '''{"criteria":[{"criterion":"得到天气参考","satisfied":true}],"coverage_status":"full","missing_information":[],"target_complete":true,"summary":"已取得足以参考的天气资料。"}'''
         return type("Response", (), {"choices": [type("Choice", (), {"message": type("Message", (), {"content": content})()})()]})()
 
 
 class TargetSettlementClient:
     class Chat:
         completions = TargetSettlementCompletions()
+    chat = Chat()
+
+
+class ToolBindingCompletions:
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        content = '{"bound":false,"reason":"参数查询南京，不服务苏州天气目标。"}'
+        return type("Response", (), {"choices": [type("Choice", (), {"message": type("Message", (), {"content": content})()})()]})()
+
+
+class ToolBindingClient:
+    class Chat:
+        completions = ToolBindingCompletions()
     chat = Chat()
 
 
@@ -264,11 +280,11 @@ def test_react_repairs_invalid_json_with_schema_tool_reference_and_user_informat
             )],
             remaining_calls=3,
             execution_context={
-                "all_tasks": [{"task_id": "weather", "objective": "比较两地天气"}],
-                "completed_tasks": [{"task_id": "weather_shanghai", "findings": ["上海天气已获取"]}],
                 "current_task_history": [{"tool_name": "weather", "status": "succeeded", "result_summary": "桂林天气已获取"}],
-                "failed_tools": [{"tool_name": "brave_web_search", "error": "fetch failed"}],
-                "coverage": {"completed": ["桂林天气"], "missing": ["上海 8 月 23 日天气"]},
+                "active_information_target": {
+                    "target_id": "shanghai-weather", "objective": "获取上海 8 月 23 日天气",
+                    "completion_criteria": ["上海 8 月 23 日天气"], "missing_information": ["上海 8 月 23 日天气"],
+                },
             },
         )
 
@@ -281,12 +297,12 @@ def test_react_repairs_invalid_json_with_schema_tool_reference_and_user_informat
         assert "查询指定城市和日期的天气预报" in calls[0]["messages"][1]["content"]
         assert "上海 8 月 23 日天气" in calls[0]["messages"][1]["content"]
         assert "用户问题" in calls[0]["messages"][1]["content"]
-        assert "当前任务成功的条件" in calls[0]["messages"][1]["content"]
-        assert "当前任务的上一步做了" in calls[0]["messages"][1]["content"]
+        assert "当前 target completion_criteria" in calls[0]["messages"][1]["content"]
+        assert "当前 target 已有 observations" in calls[0]["messages"][1]["content"]
         assert "信息达到可支持结论的参考程度即可" in calls[0]["messages"][0]["content"]
         assert "保守推断" in calls[0]["messages"][0]["content"]
-        assert "专用结算节点更新当前目标状态" in calls[0]["messages"][0]["content"]
-        assert "fetch failed" not in calls[0]["messages"][1]["content"]
+        assert "逐项检查完成条件" in calls[0]["messages"][0]["content"]
+        assert "all_tasks" not in calls[0]["messages"][1]["content"]
         assert "previous_validation_error" in calls[1]["messages"][1]["content"]
 
     asyncio.run(scenario())
@@ -374,30 +390,45 @@ def test_observation_assessment_falls_back_to_unverifiable_when_model_is_unavail
     assert assessment.relevance == "unverifiable"
 
 
-def test_target_settlement_submission_uses_one_call_without_receiving_completion_criteria():
-    """每条语义可用观察都应进入独立结算，且结算模型不得收到完成条件。"""
+def test_tool_binding_preflight_uses_only_the_current_target_and_selected_action():
+    """预检必须在 MCP 前判断南京参数不能服务苏州目标，且不注入其他 target。"""
+    async def scenario():
+        adapter = ModelAdapter(Settings(llm_model_id="fake", llm_api_key="key"), client=ToolBindingClient())
+        assessment = await adapter.assess_tool_binding_or_fallback(
+            request=DecisionRequest(query="南京和苏州周末旅游怎么选", constraints=["预算 3000"]),
+            task=TaskSpec(task_id="weather", objective="比较周末天气", agent=AgentName.LOCATION_LIFESTYLE),
+            target={"target_id": "suzhou-weather", "objective": "获取苏州天气", "completion_criteria": ["苏州天气"]},
+            tool={"name": "weather", "input_schema": {"type": "object"}}, arguments={"city": "Nanjing"},
+        )
+
+        body = ToolBindingClient.chat.completions.calls[0]["messages"][1]["content"]
+        assert assessment.bound is False
+        assert "苏州天气" in body
+        assert "Nanjing" in body
+        assert "known_information_targets" not in body
+
+    asyncio.run(scenario())
+
+
+def test_target_settlement_submission_uses_one_call_with_current_completion_criteria():
+    """每条当前目标有效观察都应进入独立结算，并逐项检查完成条件。"""
     async def scenario():
         adapter = ModelAdapter(Settings(llm_model_id="fake", llm_api_key="key"), client=TargetSettlementClient())
         submission = await adapter.settle_current_target_after_observation_or_none(
             current_target={"target_id": "weather-primary", "objective": "获取周末天气", "completion_criteria": ["得到天气参考"]},
-            tool_observation={
-                "call_id": "weather-call", "tool_name": "weather", "arguments": {"location": "甲地"},
-                "result_summary": "甲地周末晴朗。", "semantic_status": "relevant", "semantic_summary": "结果支持当前目标。",
-            },
             target_observations=[{"call_id": "weather-call", "result_summary": "甲地周末晴朗。", "semantic_status": "relevant"}],
             existing_coverage={},
         )
 
         calls = TargetSettlementClient.chat.completions.calls
         assert submission is not None
-        assert submission.coverage_updates[0].target_key == "weather-primary"
+        assert submission.target_complete is True
         assert len(calls) == 1
         assert "TargetSettlementSubmission" in calls[0]["messages"][0]["content"]
-        assert "coverage_updates" in calls[0]["messages"][0]["content"]
-        assert "target_resolution" in calls[0]["messages"][0]["content"]
+        assert "target_complete" in calls[0]["messages"][0]["content"]
         assert "weather-call" in calls[0]["messages"][1]["content"]
-        assert "completion_criteria" not in calls[0]["messages"][1]["content"]
-        assert "保留合理的推断空间" in calls[0]["messages"][0]["content"]
+        assert "completion_criteria" in calls[0]["messages"][1]["content"]
+        assert "逐条判断 criteria 是否满足" in calls[0]["messages"][0]["content"]
 
     asyncio.run(scenario())
 

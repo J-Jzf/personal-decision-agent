@@ -33,6 +33,7 @@ AGENT_CAPABILITIES: dict[str, frozenset[str]] = {
     AgentName.PLANNER.value: frozenset(),
     AgentName.JUDGE.value: frozenset(),
     AgentName.DEBATE_MODERATOR.value: frozenset(),
+    AgentName.GENERAL.value: frozenset(),
 }
 
 

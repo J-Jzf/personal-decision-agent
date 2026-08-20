@@ -12,7 +12,7 @@ from app.config import Settings
 from app.temporal_context import birth_year_range_from_age
 from models.contracts import (
     AgentName, AnalysisMode, AutonomousPlan, DecisionReport, DecisionRequest,
-    DecisionType, Evidence, EvidenceRelationship, ExecutionPlan, ExpertInformationPlan, InformationTarget, MemoryContext, ObservationAssessment, ObservationRelevance, ProfileSignalExtraction, ReActDecision, ReplanDecision, TargetResolution, TargetSettlementSubmission, TaskSpec, ToolObservation, TraceSummary,
+    DecisionType, Evidence, EvidenceRelationship, ExecutionPlan, ExpertInformationPlan, GeneralTaskResolution, InformationTarget, MemoryContext, ObservationAssessment, ObservationRelevance, ProfileSignalExtraction, ReActDecision, ReplanDecision, TargetResolution, TargetSettlementSubmission, TaskSpec, ToolBindingAssessment, ToolObservation, TraceSummary,
 )
 
 
@@ -308,6 +308,7 @@ class ModelAdapter:
     async def react_or_fallback(self, *, task: TaskSpec, request: DecisionRequest,
                                 memory: MemoryContext, observations: list[dict[str, Any]],
                                 tools: list[Any], remaining_calls: int,
+                                remaining_binding_calls: int = 3,
                                 execution_context: dict[str, Any] | None = None) -> ReActDecision:
         """让专家模型在每轮根据真实工具 Schema 和观察结果选择下一步受控动作。"""
         try:
@@ -319,19 +320,15 @@ class ModelAdapter:
                 system="你是受限 ReAct 专家。只依据任务、用户请求、记忆、已观察到的结果和允许工具行动。"
                 "调用工具时 action 必须为 call_tool，且 tool_name 必须逐字选择 allowed_tools 中的一个 name；不得输出 capability。"
                 "调用工具时必须完全符合该 tool_name 对应 input_schema；网页抓取工具通常需要 URL，不得把搜索 query 当 URL。"
-                "必须阅读 execution_context.react_context，按以下字段逐项行动：用户问题；为完成这一问题计划的全部任务有；"
-                "目前已完成的任务有；当前在完成；专家信息目标计划；当前信息目标；当前任务成功的条件是得到；当前任务本轮执行期间此前的全部工具调用；"
-                "成功摘要；已经获得的所有信息结果；跨任务和重规划继承的结构化覆盖状态；信息目标覆盖账本；任务状态账本；当前任务还需关注；"
-                "可引用证据账本中的 call_id 是 finish 时 evidence_refs 的唯一合法来源；"
-                "当前任务的上一步做了；相关记忆与 HITL 补充。上一轮失败时才会额外提供上一轮失败原因。"
+                "必须阅读 execution_context.react_context。它只包含用户问题、Task、当前 target、当前 target completion_criteria、"
+                "当前 target observations、latest_summary、coverage、missing_information、剩余额度及必要记忆和用户约束。"
+                "不得根据或索取其他 target 的摘要、缺口、状态或证据；这些资料不属于当前行动的上下文。"
                 "当选择 finish 时，必须填写 target_resolution：target_id 必须等于当前信息目标，status 只能为 complete、partial 或 blocked，"
                 "并说明公开摘要与仍缺信息。target_resolution.evidence_refs 可引用当前任务此前观察或证据账本中的 call_id；"
-                "complete 必须基于这些已经过语义核验为 relevant 或 partial 的观察。纯比较、归纳或估算目标可以引用前序资料完成，"
-                "并将 reasoning_basis 写为 conservative_inference；不得为完成状态重复调用工具。"
-                "finish 只结束当前信息目标，系统会继续下一个未完成目标。不得为了耗尽调用额度而重复搜索。"
+                "不得为完成状态重复调用工具。finish 不是提前结束接口：只有专用 Settlement 将 target_complete 标为 true 才会结束当前目标。"
                 f"{EVIDENCE_SUFFICIENCY_GUIDANCE}"
-                "每次工具成功且语义核验为 relevant 或 partial 后，系统会立即交给专用结算节点更新当前目标状态；"
-                "你无需也不得输出 coverage_updates。只有主动选择 finish 时才提交 target_resolution。"
+                "每次工具成功且 supports_current_target=true 后，系统会立即交给专用结算节点逐项检查完成条件；"
+                "partial 只能继续搜索。你无需也不得输出 coverage_updates。"
                 "失败时优先改参数、换工具或请求重规划；同工具同参数若此前失败、超时或不可用，不得再次调用；信息显著不足时可请求最多三个用户补充字段。"
                 "public_summary 只能描述将做什么及公开依据，不得暴露私有思维链。",
                 payload={
@@ -340,6 +337,7 @@ class ModelAdapter:
                     "observations": normalized_context.get("current_task_history", []),
                     "allowed_tools": tool_reference,
                     "remaining_calls": remaining_calls,
+                    "remaining_binding_calls": remaining_binding_calls,
                     "execution_context": normalized_context,
                     "react_validation_error": normalized_context.get("react_validation_error"),
                 },
@@ -351,7 +349,6 @@ class ModelAdapter:
             return self.reasoner.react(task, str(active_target.get("target_id") or f"{task.task_id}-primary"))
 
     async def settle_current_target_after_observation_or_none(self, *, current_target: dict[str, Any],
-                                                               tool_observation: dict[str, Any],
                                                                target_observations: list[dict[str, Any]],
                                                                existing_coverage: dict[str, Any]) -> TargetSettlementSubmission | None:
         """每条语义可用工具观察都立即进入专用结算，不依赖下一轮 ReAct 是否主动提交状态。"""
@@ -361,25 +358,21 @@ class ModelAdapter:
             # 每条可用观察只触发一次独立结算，不属于 ReAct 的五次 JSON 修正循环。
             schema = TargetSettlementSubmission.model_json_schema()
             system = (
-                "你是信息目标结算器。刚刚有一条工具观察通过语义核验为 relevant 或 partial。"
-                "只根据载荷中的当前信息目标、工具调用、工具结果、语义核验、该目标已有观察和已有覆盖状态，"
-                "输出当前目标的 coverage_updates 与 target_resolution；不要调用工具、不要规划、不要输出 action、不要编造用户或外部信息。"
-                "coverage_updates 只能写当前 target_id 对应的 target_key，status 只能是 partial 或 complete；"
-                "target_resolution 的 target_id 必须等于当前 target_id，status 只能是 complete、partial 或 blocked。"
-                "若当前目标还要继续检索，填写 coverage_updates 并将 target_resolution 设为 null；若当前目标应结束，填写 target_resolution。"
-                "可以保留合理的推断空间，不需要完全具体精确；资料足够支持保守参考即可，推断必须在 summary 中明确说明。"
+                "你是信息目标结算器。只根据当前信息目标、明确完成条件、该目标已支持的观察和已有覆盖状态，"
+                "逐条判断 criteria 是否满足，输出 coverage_status、missing_information、target_complete 和公开 summary。"
+                "不要调用工具、不要规划、不要输出 action、不要编造用户或外部信息。"
+                "只有每一条完成条件均被当前目标的观察支持时，target_complete 才能为 true 且 coverage_status 才能为 full；"
+                "否则必须为 partial，并明确每项未满足条件的 missing。partial 表示继续搜索，绝不结束当前目标。"
                 f"\n\n{STRUCTURED_OUTPUT_RULES}\n"
                 "输出契约名称：TargetSettlementSubmission。完整 JSON Schema：\n"
                 f"{json.dumps(schema, ensure_ascii=False)}"
             )
-            # 当前目标只保留身份、目标文本和既有状态；显式排除完成条件，防止结算模型按死板清单过度追求细节。
             sanitized_target = {
-                key: current_target[key] for key in ("target_id", "objective", "status", "latest_summary")
+                key: current_target[key] for key in ("target_id", "objective", "completion_criteria", "status", "latest_summary")
                 if key in current_target
             }
             payload = {
                 "current_target": sanitized_target,
-                "tool_observation": tool_observation,
                 "current_target_observations": target_observations,
                 "existing_coverage": existing_coverage,
             }
@@ -390,9 +383,39 @@ class ModelAdapter:
             self._fallback("target_settlement_submission", error)
             return None
 
+    async def assess_tool_binding_or_fallback(self, *, request: DecisionRequest, task: TaskSpec,
+                                               target: dict[str, Any], tool: dict[str, Any],
+                                               arguments: dict[str, Any]) -> ToolBindingAssessment:
+        """在调用 MCP 前验证参数是否实际服务当前信息目标。"""
+        try:
+            return await self._structured_with_repair(
+                operation="tool_binding_assessment",
+                system=(
+                    "你是 MCP 工具调用前的语义绑定核验器。只根据用户约束、当前任务、当前信息目标及其完成条件、"
+                    "所选工具和参数判断这组参数是否直接服务当前信息目标。"
+                    "参数符合 JSON Schema、工具被允许或任务提到相近实体，都不代表已经绑定。"
+                    "若参数查询的是另一城市、另一候选项、另一日期或另一资料目标，bound 必须为 false，并给出可公开的简短修正原因。"
+                    "不得看到、推断或提及其他信息目标，不得编造外部事实或私有思维链。"
+                ),
+                payload={
+                    "user_question": request.query,
+                    "constraints": request.constraints,
+                    "task": {"task_id": task.task_id, "objective": task.objective},
+                    "current_target": target,
+                    "selected_tool": tool,
+                    "arguments": arguments,
+                },
+                schema=ToolBindingAssessment,
+            )
+        except Exception as error:
+            self._fallback("tool_binding_assessment", error)
+            return ToolBindingAssessment(
+                bound=False,
+                reason="调用前语义绑定模型不可用，无法安全确认工具参数服务当前信息目标。",
+            )
+
     async def assess_observation_or_fallback(self, *, request: DecisionRequest, task: TaskSpec,
-                                             target: dict[str, Any], observation: ToolObservation,
-                                             known_targets: list[dict[str, Any]] | None = None) -> ObservationAssessment:
+                                             target: dict[str, Any], observation: ToolObservation) -> ObservationAssessment:
         """用模型判断工具内容是否真正支撑当前目标，绝不以传输状态或关键词代替语义判断。"""
         try:
             return await self._structured_with_repair(
@@ -402,13 +425,12 @@ class ModelAdapter:
                     "判断该内容是否实际支撑当前目标。不得按关键词或传输状态猜测相关性：MCP 成功、HTTP 成功或文本提到相似地名都不等于相关。"
                     "输出 relevant（足以支撑）、partial（相关、可作合理推断但不完整）、irrelevant（内容与当前目标完全无关且无法作合理推断）"
                     "或 unverifiable（内容不足以判断）。除完全无关外，宁可保守标记为 partial 并说明缺口，不要因资料不够精确而标记 irrelevant。"
-                    "如果资料不直接支持当前目标、但明确支持载荷中另一个已知目标，应输出 partial、supports_current_target=false，"
-                    "并在 related_target_ids 中列出那些目标；不得把这种交叉资料误算为当前目标完成。"
+                    "如果资料不直接支持当前目标，supports_current_target 必须为 false；related_target_ids 只可作为旁路 metadata，"
+                    "不得把它用于任何其他目标的覆盖更新。coverage_contribution 只能是 partial 或 full，且只描述当前目标的覆盖贡献。"
                     "summary 只陈述公开的核验依据；不得编造外部事实或私有思维链。"
                 ),
                 payload={
                     "user_question": request.query, "task": task.model_dump(mode="json"), "target": target,
-                    "known_information_targets": known_targets or [],
                     "completion_criteria": target.get("completion_criteria", task.completion_criteria),
                     "tool_observation": observation.model_dump(mode="json"),
                 },
@@ -420,6 +442,29 @@ class ModelAdapter:
                 relevance=ObservationRelevance.UNVERIFIABLE,
                 summary="模型不可用，无法核验本次工具返回是否与当前信息目标相关。",
                 missing_information=list(target.get("completion_criteria", task.completion_criteria)),
+            )
+
+    async def resolve_general_task_or_fallback(self, *, task: TaskSpec, request: DecisionRequest,
+                                               memory: MemoryContext, execution_context: dict[str, Any]) -> GeneralTaskResolution:
+        """让通用 Agent 一次性完成综合、归纳或比较类任务。"""
+        try:
+            return await self._structured_with_repair(
+                operation="general_task_resolution",
+                system=(
+                    "你是通用决策执行 Agent。只依据给定任务、用户约束、记忆和任务范围内证据，完成一次公开的综合、比较或归纳。"
+                    "不得调用工具、不得编造外部事实或私有思维链；证据不足时在 uncertainties 中说明，并使用 completed_with_gaps 或 blocked。"
+                ),
+                payload={
+                    "task": task.model_dump(mode="json"), "request": request.model_dump(mode="json"),
+                    "memory": memory.model_dump(mode="json"), "task_execution_context": execution_context,
+                },
+                schema=GeneralTaskResolution,
+            )
+        except Exception as error:
+            self._fallback("general_task_resolution", error)
+            return GeneralTaskResolution(
+                summary="通用综合模型不可用，未将未核验资料当作结论。",
+                findings=[], uncertainties=["通用综合模型不可用"], completion_status="blocked",
             )
 
     async def replan_decision_or_fallback(self, *, request: DecisionRequest,
@@ -541,13 +586,13 @@ class ModelAdapter:
         existing = normalized.get("react_context")
         react_context = dict(existing) if isinstance(existing, dict) else {}
         last = observations[-1] if observations else None
+        active_target = dict(normalized.get("active_information_target", {}))
+        target_id = active_target.get("target_id")
+        target_coverage = normalized.get("information_coverage", {}).get(target_id, {}) if target_id else {}
         react_context.setdefault("用户问题", request.query)
-        react_context.setdefault("为完成这一问题计划的全部任务有", normalized.get("all_tasks", []))
-        react_context.setdefault("目前已完成的任务有", normalized.get("completed_tasks", []))
-        react_context.setdefault("当前在完成", task.model_dump(mode="json"))
-        react_context.setdefault("专家信息目标计划", normalized.get("information_targets", []))
-        react_context.setdefault("当前信息目标", normalized.get("active_information_target", {}))
-        react_context.setdefault("当前任务成功的条件是得到", task.completion_criteria)
+        react_context.setdefault("Task", {"task_id": task.task_id, "objective": task.objective})
+        react_context.setdefault("当前 target", active_target)
+        react_context.setdefault("当前 target completion_criteria", active_target.get("completion_criteria", task.completion_criteria))
         prompt_history = [
             {
                 **{"tool_name": item.get("tool_name"), "arguments": item.get("arguments", {}), "status": item.get("status")},
@@ -557,40 +602,21 @@ class ModelAdapter:
             }
             for item in observations
         ]
-        # 历史失败详情不作为重复上下文传入，只在上一轮失败时单列原因。
-        normalized["current_task_history"] = prompt_history
-        normalized.pop("failed_tools", None)
-        coverage = dict(normalized.get("coverage", {}))
-        coverage.pop("current_failed_results", None)
-        normalized["coverage"] = coverage
-        normalized["task_statuses"] = [
-            {key: value for key, value in item.items() if key not in {"uncertainties", "error"}}
-            for item in normalized.get("task_statuses", [])
-            if isinstance(item, dict)
-        ]
-        react_context.setdefault("当前任务本轮执行期间此前的全部工具调用", prompt_history)
-        react_context.setdefault("成功摘要", [
-            item.get("result_summary") for item in observations
-            if item.get("status") == "succeeded" and item.get("semantic_status") in {None, "relevant", "partial"}
-            and item.get("result_summary")
-        ])
-        react_context.setdefault("已经获得的所有信息结果", normalized.get("all_successful_information", []))
-        react_context.setdefault("跨任务和重规划继承的结构化覆盖状态", normalized.get("structured_coverage", {}))
-        react_context.setdefault("信息目标覆盖账本", normalized.get("information_coverage", {}))
-        react_context.setdefault("可引用证据账本", normalized.get("evidence_ledger", []))
-        react_context.setdefault("任务状态账本", normalized.get("task_statuses", []))
-        react_context.setdefault("当前任务还需关注", normalized.get("coverage", {}).get("missing", task.completion_criteria))
-        react_context.setdefault("当前任务的上一步做了", {
-            "工具指令": {"tool_name": last.get("tool_name"), "arguments": last.get("arguments", {})},
-            "结果": last.get("result_summary") or last.get("error"), "状态": last.get("status"),
-        } if last else "这是当前任务的第一轮，尚未调用工具。")
+        react_context.setdefault("当前 target 已有 observations", prompt_history)
+        react_context.setdefault("当前 target latest_summary", active_target.get("latest_summary"))
+        react_context.setdefault("当前 target coverage", target_coverage)
+        react_context.setdefault("当前 target missing_information", active_target.get("missing_information", active_target.get("completion_criteria", task.completion_criteria)))
         react_context.setdefault("相关记忆与 HITL 补充", {
             "memory": memory.model_dump(mode="json"), "hitl": request.context.get("hitl", {}),
         })
         if last and last.get("status") != "succeeded" and last.get("error"):
             react_context.setdefault("上一轮失败原因", last["error"])
-        normalized["react_context"] = react_context
-        return normalized
+        return {
+            "active_information_target": active_target,
+            "current_task_history": prompt_history,
+            "react_context": react_context,
+            "react_validation_error": normalized.get("react_validation_error"),
+        }
 
     def reset_fallback_events(self) -> None:
         """每次新决策前清除前次请求留下的降级诊断。"""

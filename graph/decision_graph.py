@@ -16,6 +16,7 @@ from app.temporal_context import merge_temporal_context
 from agents.debate import DebateArgument, DebateModerator
 from agents.evidence_research import EvidenceResearchAgent
 from agents.financial_market import FinancialMarketAgent
+from agents.general import GeneralAgent
 from agents.location_lifestyle import LocationLifestyleAgent
 from agents.preference import PreferenceAgent
 from agents.risk_critic import RiskCritic
@@ -45,6 +46,7 @@ class DecisionGraph:
             AgentName.LOCATION_LIFESTYLE: LocationLifestyleAgent(),
             AgentName.PREFERENCE: PreferenceAgent(),
             AgentName.RISK_CRITIC: RiskCritic(),
+            AgentName.GENERAL: GeneralAgent(),
         }
         self._hitl_waiters: dict[tuple[str, str], asyncio.Future[HITLResponse]] = {}
 

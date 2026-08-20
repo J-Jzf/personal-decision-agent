@@ -6,6 +6,40 @@ from models.contracts import AgentName, AutonomousPlan, DecisionRequest, Decisio
 from skills.registry import SkillDefinition
 
 
+AGENT_EXECUTION_CATALOG: dict[AgentName, dict[str, object]] = {
+    AgentName.EVIDENCE_RESEARCH: {
+        "description": "检索并整理外部网页、地点和事实资料。",
+        "capabilities": {"web_search", "fetch_page", "place_search"},
+        "objective_terms": ("检索", "证据", "网页", "资料", "事实", "研究"),
+    },
+    AgentName.FINANCIAL_MARKET: {
+        "description": "检索和分析市场、价格、持仓或财务数据。",
+        "capabilities": {"web_search", "fetch_page", "market_data"},
+        "objective_terms": ("市场", "金融", "财务", "价格", "股票", "基金", "持仓"),
+    },
+    AgentName.LOCATION_LIFESTYLE: {
+        "description": "检索地点、路线、天气和生活方式资料。",
+        "capabilities": {"web_search", "fetch_page", "place_search", "route_search", "weather_forecast"},
+        "objective_terms": ("地点", "路线", "天气", "通勤", "城市", "旅行", "生活方式"),
+    },
+    AgentName.PREFERENCE: {
+        "description": "仅读取、提取和匹配用户显式偏好与长期记忆。",
+        "capabilities": set(),
+        "objective_terms": ("偏好", "记忆", "画像", "匹配"),
+    },
+    AgentName.RISK_CRITIC: {
+        "description": "检查硬约束、证据缺口、反例和过度结论。",
+        "capabilities": set(),
+        "objective_terms": ("风险", "约束", "反例", "缺口", "审查"),
+    },
+    AgentName.GENERAL: {
+        "description": "一次性执行无专门专家可承担的综合、比较、归纳或推荐任务。",
+        "capabilities": set(),
+        "objective_terms": (),
+    },
+}
+
+
 class Planner:
     """将模型自主规划转换为受工具目录和专家权限约束的可执行任务图。"""
 
@@ -26,7 +60,7 @@ class Planner:
         )
         valid_skills = {definition.name for definition in skills}
         skill_name = selected.skill_name if selected.skill_name in valid_skills else None
-        allowed_agents = {AgentName.EVIDENCE_RESEARCH, AgentName.FINANCIAL_MARKET, AgentName.LOCATION_LIFESTYLE, AgentName.PREFERENCE, AgentName.RISK_CRITIC}
+        allowed_agents = set(AGENT_EXECUTION_CATALOG)
         available_capabilities = {
             descriptor.capability for descriptor in tools
             if hasattr(descriptor, "capability")
@@ -35,8 +69,12 @@ class Planner:
         for task in selected.plan.tasks:
             if task.agent not in allowed_agents:
                 continue
-            permitted = [capability for capability in task.required_capabilities if capability in available_capabilities]
-            tasks.append(task.model_copy(update={"required_capabilities": permitted}))
+            agent = task.agent if self.agent_can_execute(task.agent, task.objective) else AgentName.GENERAL
+            permitted = [
+                capability for capability in task.required_capabilities
+                if capability in available_capabilities and capability in self._capabilities_for_agent(agent)
+            ]
+            tasks.append(task.model_copy(update={"agent": agent, "required_capabilities": permitted}))
         plan = selected.plan.model_copy(update={"tasks": tasks})
         return selected.model_copy(update={"skill_name": skill_name, "plan": plan})
 
@@ -46,7 +84,7 @@ class Planner:
         task_ids: list[str] = []
         for agent in agents:
             identifier = agent.value
-            dependencies = list(task_ids) if agent == AgentName.RISK_CRITIC else []
+            dependencies = list(task_ids) if agent in {AgentName.GENERAL, AgentName.RISK_CRITIC} else []
             capabilities = self._capabilities(agent, skill)
             tasks.append(TaskSpec(
                 task_id=identifier, objective=self._objective(agent, request, skill), agent=agent,
@@ -74,27 +112,41 @@ class Planner:
                 agent = AgentName(raw)
             except ValueError:
                 continue
-            if agent in {AgentName.EVIDENCE_RESEARCH, AgentName.FINANCIAL_MARKET, AgentName.LOCATION_LIFESTYLE, AgentName.PREFERENCE, AgentName.RISK_CRITIC}:
+            if agent in AGENT_EXECUTION_CATALOG:
                 base.append(agent)
+        base.append(AgentName.GENERAL)
         base.append(AgentName.RISK_CRITIC)
         return list(dict.fromkeys(base))
 
     @staticmethod
     def _capabilities(agent: AgentName, skill: SkillDefinition) -> list[str]:
-        allowed = {
-            AgentName.EVIDENCE_RESEARCH: {"web_search", "fetch_page", "place_search"},
-            AgentName.FINANCIAL_MARKET: {"web_search", "fetch_page", "market_data"},
-            AgentName.LOCATION_LIFESTYLE: {"web_search", "fetch_page", "place_search", "route_search", "weather_forecast"},
-        }.get(agent, set())
+        allowed = Planner._capabilities_for_agent(agent)
         return [tool for tool in skill.recommended_tools if tool in allowed] or ([sorted(allowed)[0]] if allowed else [])
 
     @staticmethod
+    def _capabilities_for_agent(agent: AgentName) -> set[str]:
+        return set(AGENT_EXECUTION_CATALOG.get(agent, {}).get("capabilities", set()))
+
+    @staticmethod
+    def agent_can_execute(agent: AgentName, objective: str) -> bool:
+        """只允许 Planner 将目标分给其真实 execute 行为能够完成的 Agent。"""
+        if agent is AgentName.GENERAL:
+            return True
+        catalog = AGENT_EXECUTION_CATALOG.get(agent)
+        if catalog is None:
+            return False
+        normalized = objective.casefold()
+        return any(term.casefold() in normalized for term in catalog["objective_terms"])
+
+    @staticmethod
     def _objective(agent: AgentName, request: DecisionRequest, skill: SkillDefinition) -> str:
+        if agent is AgentName.PREFERENCE:
+            return "读取并匹配用户显式偏好和历史记忆；只输出可追溯的偏好信号，不做综合比较或推荐。"
         labels = {
             AgentName.EVIDENCE_RESEARCH: "检索并标注外部证据",
             AgentName.FINANCIAL_MARKET: "分析市场与财务数据",
             AgentName.LOCATION_LIFESTYLE: "比较地点、通勤、天气与生活方式",
-            AgentName.PREFERENCE: "匹配显式偏好和历史记忆",
             AgentName.RISK_CRITIC: "对硬约束、证据质量、遗漏和反例做对抗检查",
+            AgentName.GENERAL: "综合已有资料、用户偏好与约束，形成可追溯的比较或推荐",
         }
         return f"{labels[agent]}：{request.query}；维度：{', '.join(skill.analysis_dimensions)}"

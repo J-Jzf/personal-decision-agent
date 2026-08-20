@@ -74,6 +74,7 @@ class AgentName(str, Enum):
     RISK_CRITIC = "risk_critic"
     JUDGE = "judge"
     DEBATE_MODERATOR = "debate_moderator"
+    GENERAL = "general"
 
 
 class ToolCallStatus(str, Enum):
@@ -292,17 +293,60 @@ class ReActDecision(ContractModel):
 
 
 class TargetSettlementSubmission(ContractModel):
-    """模型遗漏当前目标结算时专用的补交合同，不携带新的工具调用或私有推理。"""
+    """只结算当前信息目标的完成条件，不跨目标写入覆盖状态。"""
 
-    coverage_updates: list[InformationCoverageUpdate] = Field(max_length=6)
-    target_resolution: TargetResolution | None = Field(...)
+    criteria: list["TargetCriterionSettlement"] = Field(min_length=1, max_length=6)
+    coverage_status: Literal["partial", "full"]
+    missing_information: list[str] = Field(default_factory=list, max_length=8)
+    target_complete: bool
+    summary: str = Field(min_length=1, max_length=1000)
 
     @model_validator(mode="after")
-    def includes_at_least_one_settlement(self) -> "TargetSettlementSubmission":
-        """拒绝空对象，确保补交请求确实能驱动当前信息目标状态更新。"""
-        if not self.coverage_updates and self.target_resolution is None:
-            raise ValueError("target settlement submission requires coverage_updates or target_resolution")
+    def completion_matches_criteria(self) -> "TargetSettlementSubmission":
+        """提前结束只能建立在所有当前完成条件均已满足的基础上。"""
+        if self.target_complete and not all(item.satisfied for item in self.criteria):
+            raise ValueError("complete target settlement requires every criterion to be satisfied")
+        if self.target_complete and self.coverage_status != "full":
+            raise ValueError("complete target settlement requires full coverage")
+        if not self.target_complete and self.coverage_status != "partial":
+            raise ValueError("incomplete target settlement requires partial coverage")
         return self
+
+
+class TargetCriterionSettlement(ContractModel):
+    """当前信息目标中一项明确完成条件的公开结算。"""
+
+    criterion: str = Field(min_length=1, max_length=400)
+    satisfied: bool
+    missing: str | None = Field(default=None, max_length=600)
+
+    @model_validator(mode="after")
+    def missing_matches_satisfaction(self) -> "TargetCriterionSettlement":
+        if not self.satisfied and not (self.missing or "").strip():
+            raise ValueError("unsatisfied criterion requires missing information")
+        return self
+
+
+class ToolBindingAssessment(ContractModel):
+    """调用前验证工具参数是否直接服务当前信息目标。"""
+
+    bound: bool
+    reason: str = Field(default="", max_length=800)
+
+    @model_validator(mode="after")
+    def reason_matches_binding(self) -> "ToolBindingAssessment":
+        if not self.bound and not self.reason.strip():
+            raise ValueError("unbound assessment requires reason")
+        return self
+
+
+class GeneralTaskResolution(ContractModel):
+    """通用 Agent 对不属于专门专家职责的任务给出的单次公开结算。"""
+
+    summary: str = Field(min_length=1, max_length=1000)
+    findings: list[str] = Field(default_factory=list, max_length=12)
+    uncertainties: list[str] = Field(default_factory=list, max_length=8)
+    completion_status: Literal["completed", "completed_with_gaps", "blocked"]
 
 
 class ProfileSignalExtraction(ContractModel):
@@ -358,6 +402,7 @@ class ToolObservation(ContractModel):
     semantic_missing_information: list[str] = Field(default_factory=list, max_length=8)
     # False 表示资料不直接完成当前目标，但可供同一决策的相关目标在后续结算时引用。
     supports_current_target: bool = True
+    coverage_contribution: Literal["partial", "full"] = "partial"
     related_target_ids: list[str] = Field(default_factory=list, max_length=5)
     latency_ms: int | None = Field(default=None, ge=0)
     result_summary: str | None = None
@@ -385,6 +430,7 @@ class ObservationAssessment(ContractModel):
     missing_information: list[str] = Field(default_factory=list, max_length=8)
     # 交叉目标资料仍可为 partial，但不能被当前目标的覆盖更新误用。
     supports_current_target: bool = True
+    coverage_contribution: Literal["partial", "full"] = "partial"
     related_target_ids: list[str] = Field(default_factory=list, max_length=5)
 
     @field_validator("related_target_ids")

@@ -182,3 +182,28 @@ def test_agent_result_accepts_completed_with_gaps_when_evidence_is_useful_but_in
     )
 
     assert result.completion_status is TaskStatus.COMPLETED_WITH_GAPS
+
+
+def test_unbound_tool_preflight_requires_a_public_reason():
+    """未绑定动作若没有理由，下一轮 ReAct 无法修正参数。"""
+    from models.contracts import ToolBindingAssessment
+
+    with pytest.raises(ValidationError, match="reason"):
+        ToolBindingAssessment(bound=False, reason="")
+
+
+def test_complete_target_settlement_requires_every_criterion_to_be_satisfied():
+    """只满足部分完成条件不能把当前信息目标提前结束。"""
+    from models.contracts import TargetCriterionSettlement, TargetSettlementSubmission
+
+    with pytest.raises(ValidationError, match="every criterion"):
+        TargetSettlementSubmission(
+            criteria=[
+                TargetCriterionSettlement(criterion="南京天气", satisfied=True),
+                TargetCriterionSettlement(criterion="苏州天气", satisfied=False, missing="缺少苏州天气"),
+            ],
+            coverage_status="partial",
+            missing_information=["缺少苏州天气"],
+            target_complete=True,
+            summary="仅有南京天气资料。",
+        )

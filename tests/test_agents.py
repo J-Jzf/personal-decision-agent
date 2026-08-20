@@ -6,8 +6,8 @@ from models.contracts import AgentName, DecisionRequest, DecisionType, ExpertInf
 from skills.registry import SkillRegistry
 
 
-def test_react_context_keeps_successful_information_and_only_exposes_the_latest_failure():
-    """模型上下文应继承成功资料，历史失败原因只在它恰好是上一轮时才暴露。"""
+def test_react_context_is_limited_to_the_active_target_and_its_history():
+    """ReAct 不得因其他 target 的状态、资料或缺口受到污染。"""
     from models.contracts import TaskSpec
 
     task = TaskSpec(
@@ -24,21 +24,29 @@ def test_react_context_keeps_successful_information_and_only_exposes_the_latest_
             "all_tasks": [{"task_id": "weather"}],
             "structured_coverage": {"weather": {"covered_locations": ["南京"], "missing_locations": ["苏州"]}},
             "all_successful_information": [{"task_id": "earlier", "result_summary": "南京天气已获得"}],
+            "active_information_target": {
+                "target_id": "suzhou", "objective": "获取苏州天气", "completion_criteria": ["苏州天气"],
+                "status": "partial", "latest_summary": "苏州温度已取得", "missing_information": ["苏州降雨"],
+            },
         },
+        information_targets=[
+            {"target_id": "nanjing", "objective": "获取南京天气", "status": "complete", "latest_summary": "南京已完成"},
+            {"target_id": "suzhou", "objective": "获取苏州天气", "status": "partial", "latest_summary": "苏州温度已取得"},
+        ],
     )
 
     prompt_history = BaseReActAgent._prompt_task_history(observations)
     view = BaseReActAgent._react_context_view(task, context, prompt_history, {})
 
-    assert view["当前任务本轮执行期间此前的全部工具调用"][0]["status"] == "failed"
-    assert "error" not in view["当前任务本轮执行期间此前的全部工具调用"][0]
-    assert view["成功摘要"] == ["苏州天气已获得"]
-    assert view["已经获得的所有信息结果"] == [{"task_id": "earlier", "result_summary": "南京天气已获得"}]
-    assert view["跨任务和重规划继承的结构化覆盖状态"]["weather"]["covered_locations"] == ["南京"]
-    assert "上一轮失败原因" not in view
-
-    failed_last = BaseReActAgent._react_context_view(task, context, observations[:1], {})
-    assert failed_last["上一轮失败原因"] == "temporary error"
+    assert view["当前 target"]["target_id"] == "suzhou"
+    assert view["当前 target completion_criteria"] == ["苏州天气"]
+    assert view["当前 target 已有 observations"][0]["status"] == "failed"
+    assert view["当前 target latest_summary"] == "苏州温度已取得"
+    assert view["当前 target missing_information"] == ["苏州降雨"]
+    assert "所有 target" not in view
+    assert "所有任务" not in view
+    assert "南京已完成" not in str(view)
+    assert "南京天气已获得" not in str(view)
 
 
 def test_information_coverage_replaces_partial_result_with_a_complete_result():
@@ -65,8 +73,8 @@ def test_information_coverage_replaces_partial_result_with_a_complete_result():
     assert record["history"][0]["previous_status"] == "partial"
 
 
-def test_react_context_exposes_referenceable_verified_evidence_for_a_derived_target():
-    """纯归纳目标必须看到可引用的 call_id，模型才能结算前序资料而不重复调用工具。"""
+def test_react_context_hides_cross_target_evidence_from_the_active_target():
+    """旁路资料只交给总控，当前 target 的 ReAct 不得直接引用它。"""
     from models.contracts import TaskSpec
 
     context = AgentContext(
@@ -84,7 +92,8 @@ def test_react_context_exposes_referenceable_verified_evidence_for_a_derived_tar
         context, [], {},
     )
 
-    assert view["可引用证据账本"][0]["call_id"] == "call-a"
+    assert "可引用证据账本" not in view
+    assert "call-a" not in str(view)
 
 
 def test_result_for_another_known_target_is_referenceable_without_completing_the_current_target():
@@ -174,6 +183,22 @@ def test_portfolio_routes_financial_agent():
     assert AgentName.FINANCIAL_MARKET in {task.agent for task in plan.tasks}
 
 
+def test_planner_routes_synthesis_to_general_instead_of_preference_memory_reader():
+    """PreferenceAgent 只读记忆，综合推荐必须交给实际能执行综合的 GeneralAgent。"""
+    registry = SkillRegistry(__import__("pathlib").Path("skills")); registry.load_all()
+    plan = asyncio.run(Planner().create_plan(
+        DecisionRequest(query="综合天气、景点、偏好和预算，推荐南京或苏州"),
+        registry.get("travel-destination-compare"), DecisionType.TRAVEL,
+    ))
+
+    general_task = next(task for task in plan.tasks if task.agent is AgentName.GENERAL)
+    preference_task = next(task for task in plan.tasks if task.agent is AgentName.PREFERENCE)
+    assert "综合" in general_task.objective
+    assert "用户显式偏好" in preference_task.objective
+    assert "南京" not in preference_task.objective
+    assert not Planner.agent_can_execute(AgentName.PREFERENCE, "综合天气、景点和预算后推荐城市")
+
+
 def test_react_blocks_duplicate_tool_name_and_arguments_before_a_second_mcp_call():
     """重复的同工具同参数调用应作为失败观察反馈给专家，而非再次访问外部服务。"""
     task = __import__("models.contracts", fromlist=["TaskSpec"]).TaskSpec(
@@ -244,12 +269,11 @@ def test_react_switches_target_immediately_after_a_complete_coverage_update():
             return ObservationAssessment(relevance="relevant", summary="结果支持当前城市资料。")
 
         async def settle_current_target_after_observation_or_none(self, **kwargs):
+            from models.contracts import TargetCriterionSettlement, TargetSettlementSubmission
             assert kwargs["current_target"]["target_id"] == "nanjing"
-            return __import__("types").SimpleNamespace(
-                coverage_updates=[InformationCoverageUpdate(
-                    target_key="nanjing", target="南京资料", status="complete", summary="南京资料已获得",
-                )],
-                target_resolution=None,
+            return TargetSettlementSubmission(
+                criteria=[TargetCriterionSettlement(criterion="已获得南京资料", satisfied=True)],
+                coverage_status="full", missing_information=[], target_complete=True, summary="南京资料已获得",
             )
 
     class TargetGateway:
@@ -278,7 +302,6 @@ def test_react_switches_target_immediately_after_a_complete_coverage_update():
 
 def test_react_settles_a_usable_observation_before_requesting_the_next_react_action():
     """语义可用观察产生后，应立即进入专用结算节点而不是等待下一轮 ReAct。"""
-    from types import SimpleNamespace
     from models.contracts import ReActDecision, TaskSpec
 
     class ImmediateSettlementAdapter:
@@ -303,16 +326,15 @@ def test_react_settles_a_usable_observation_before_requesting_the_next_react_act
             return ObservationAssessment(relevance="relevant", summary="天气资料支持当前目标。")
 
         async def settle_current_target_after_observation_or_none(self, **kwargs):
+            from models.contracts import TargetCriterionSettlement, TargetSettlementSubmission
             self.settlement_requests += 1
             assert kwargs["current_target"]["target_id"] == "city-weather"
-            assert "completion_criteria" not in kwargs["current_target"]
-            assert kwargs["tool_observation"]["tool_name"] == "weather"
-            assert kwargs["tool_observation"]["semantic_status"] == "relevant"
-            return SimpleNamespace(
-                coverage_updates=[InformationCoverageUpdate(
-                    target_key="city-weather", target="获取城市周末天气", status="complete", summary="天气资料已经足够参考。",
-                )],
-                target_resolution=None,
+            assert kwargs["current_target"]["completion_criteria"] == ["得到天气参考"]
+            assert kwargs["target_observations"][0]["tool_name"] == "weather"
+            assert kwargs["target_observations"][0]["semantic_status"] == "relevant"
+            return TargetSettlementSubmission(
+                criteria=[TargetCriterionSettlement(criterion="得到天气参考", satisfied=True)],
+                coverage_status="full", missing_information=[], target_complete=True, summary="天气资料已经足够参考。",
             )
 
     class SingleWeatherGateway:
@@ -395,68 +417,6 @@ def test_semantically_irrelevant_transport_success_does_not_become_an_agent_find
     assert context.observations[0].semantic_status == "irrelevant"
 
 
-def test_react_can_complete_a_comparison_target_by_referencing_prior_verified_observations():
-    """比较目标可引用同一专家先前资料，不能因自己未调用工具而被错误阻塞。"""
-    from models.contracts import ReActDecision, TaskSpec
-
-    class DerivedConclusionAdapter:
-        def __init__(self):
-            self.turn = 0
-
-        async def information_plan_or_fallback(self, **kwargs):
-            return ExpertInformationPlan(targets=[
-                InformationTarget(target_id="option-a", objective="获取选项 A 条件", completion_criteria=["得到 A 条件"]),
-                InformationTarget(target_id="option-b", objective="获取选项 B 条件", completion_criteria=["得到 B 条件"]),
-                InformationTarget(target_id="comparison", objective="基于 A、B 条件形成比较", completion_criteria=["完成比较"]),
-            ])
-
-        async def react_or_fallback(self, **kwargs):
-            self.turn += 1
-            decisions = {
-                1: ReActDecision(action="call_tool", public_summary="查询 A", tool_name="search", arguments={"query": "A"}),
-                2: ReActDecision(action="finish", public_summary="A 已获得", target_resolution=TargetResolution(
-                    target_id="option-a", status="complete", summary="A 条件已获得。",
-                )),
-                3: ReActDecision(action="call_tool", public_summary="查询 B", tool_name="search", arguments={"query": "B"}),
-                4: ReActDecision(action="finish", public_summary="B 已获得", target_resolution=TargetResolution(
-                    target_id="option-b", status="complete", summary="B 条件已获得。",
-                )),
-                5: ReActDecision(action="finish", public_summary="比较已完成", target_resolution=TargetResolution(
-                    target_id="comparison", status="complete", summary="已基于 A、B 条件完成保守比较。",
-                    evidence_refs=["call-a", "call-b"], reasoning_basis="conservative_inference",
-                )),
-            }
-            return decisions[self.turn]
-
-        async def assess_observation_or_fallback(self, **kwargs):
-            return ObservationAssessment(relevance="relevant", summary="结果直接支持当前目标。")
-
-    class TwoFactGateway:
-        def __init__(self):
-            self.calls = 0
-
-        async def call_tool(self, agent, tool_name, arguments, **kwargs):
-            self.calls += 1
-            return ToolObservation(
-                call_id="call-a" if self.calls == 1 else "call-b", decision_id=kwargs["decision_id"],
-                task_id=kwargs["task_id"], agent=agent, tool_name=tool_name, arguments=arguments,
-                status=ToolCallStatus.SUCCEEDED, result_summary=f"{arguments['query']} 的已验证资料",
-            )
-
-    gateway = TwoFactGateway()
-    context = AgentContext(
-        decision_id="d", gateway=gateway, memory=MemoryContext(), model_adapter=DerivedConclusionAdapter(),
-        request=DecisionRequest(query="比较 A 和 B"),
-    )
-    result = asyncio.run(BaseReActAgent().execute(
-        TaskSpec(task_id="research", objective="比较 A 和 B", agent=AgentName.EVIDENCE_RESEARCH), context,
-    ))
-
-    assert gateway.calls == 2
-    assert context.information_targets[-1]["status"] == "complete"
-    assert result.completion_status is TaskStatus.COMPLETED
-
-
 def test_react_rejects_a_derived_completion_that_references_unknown_evidence():
     """模型不得用不存在的观察 ID 把纯归纳目标伪装为已完成。"""
     from models.contracts import ReActDecision, TaskSpec
@@ -478,3 +438,133 @@ def test_react_rejects_a_derived_completion_that_references_unknown_evidence():
 
     assert error is not None
     assert "evidence_refs" in error
+
+
+def test_unbound_preflight_rejects_parameters_before_mcp_without_spending_tool_quota():
+    """当前苏州目标不能因查询南京而浪费任何一次 MCP 调用。"""
+    from models.contracts import ReActDecision, TaskSpec, ToolBindingAssessment
+
+    class PreflightAdapter:
+        async def information_plan_or_fallback(self, **kwargs):
+            return ExpertInformationPlan(targets=[InformationTarget(
+                target_id="suzhou-weather", objective="获取苏州周末天气", completion_criteria=["苏州天气"],
+            )])
+
+        async def react_or_fallback(self, **kwargs):
+            if kwargs["execution_context"].get("react_validation_error"):
+                return ReActDecision(action="request_replan", public_summary="参数未绑定，停止当前测试。")
+            return ReActDecision(
+                action="call_tool", public_summary="查询天气", tool_name="weather", arguments={"city": "Nanjing"},
+            )
+
+        async def assess_tool_binding_or_fallback(self, **kwargs):
+            assert kwargs["target"]["target_id"] == "suzhou-weather"
+            assert kwargs["arguments"] == {"city": "Nanjing"}
+            assert "information_targets" not in kwargs
+            return ToolBindingAssessment(bound=False, reason="参数查询南京，不服务苏州天气目标。")
+
+    class NeverCalledGateway:
+        def __init__(self):
+            self.calls = 0
+
+        async def call_tool(self, *args, **kwargs):
+            self.calls += 1
+            raise AssertionError("未绑定参数不得调用 MCP")
+
+    gateway = NeverCalledGateway()
+    context = AgentContext(
+        decision_id="d", gateway=gateway, memory=MemoryContext(), model_adapter=PreflightAdapter(),
+        request=DecisionRequest(query="南京和苏州周末旅游怎么选"),
+        available_tools=[{"name": "weather", "input_schema": {"type": "object"}}],
+    )
+    asyncio.run(BaseReActAgent().execute(
+        TaskSpec(task_id="weather", objective="比较天气", agent=AgentName.EVIDENCE_RESEARCH), context,
+    ))
+
+    target = context.information_targets[0]
+    assert gateway.calls == 0
+    assert target["binding_calls_used"] == 1
+    assert target["tool_calls_used"] == 0
+    assert any("不服务苏州天气" in (item.error or "") for item in context.observations)
+
+
+def test_partial_settlement_keeps_the_same_target_active_until_a_full_settlement():
+    """partial 只能累计当前目标资料，不能提前跳到下一个目标。"""
+    from models.contracts import ReActDecision, TargetCriterionSettlement, TargetSettlementSubmission, TaskSpec
+
+    class SettlementAdapter:
+        def __init__(self):
+            self.react_calls = 0
+            self.settlement_calls = 0
+
+        async def information_plan_or_fallback(self, **kwargs):
+            return ExpertInformationPlan(targets=[InformationTarget(
+                target_id="city-weather", objective="获取两座城市周末天气",
+                completion_criteria=["南京天气", "苏州天气"],
+            )])
+
+        async def react_or_fallback(self, **kwargs):
+            self.react_calls += 1
+            if self.react_calls > 2:
+                raise AssertionError("完整结算后不应继续当前目标")
+            return ReActDecision(
+                action="call_tool", public_summary="继续补齐天气", tool_name="weather",
+                arguments={"city": "南京" if self.react_calls == 1 else "苏州"},
+            )
+
+        async def assess_tool_binding_or_fallback(self, **kwargs):
+            from models.contracts import ToolBindingAssessment
+            return ToolBindingAssessment(bound=True)
+
+        async def assess_observation_or_fallback(self, **kwargs):
+            return ObservationAssessment(
+                relevance="relevant", summary="结果支持当前天气目标。", supports_current_target=True,
+                coverage_contribution="partial",
+            )
+
+        async def settle_current_target_after_observation_or_none(self, **kwargs):
+            self.settlement_calls += 1
+            assert kwargs["current_target"]["completion_criteria"] == ["南京天气", "苏州天气"]
+            assert "all_targets" not in kwargs
+            if self.settlement_calls == 1:
+                return TargetSettlementSubmission(
+                    criteria=[
+                        TargetCriterionSettlement(criterion="南京天气", satisfied=True),
+                        TargetCriterionSettlement(criterion="苏州天气", satisfied=False, missing="缺少苏州天气"),
+                    ],
+                    coverage_status="partial", missing_information=["缺少苏州天气"],
+                    target_complete=False, summary="仅取得南京天气。",
+                )
+            return TargetSettlementSubmission(
+                criteria=[
+                    TargetCriterionSettlement(criterion="南京天气", satisfied=True),
+                    TargetCriterionSettlement(criterion="苏州天气", satisfied=True),
+                ],
+                coverage_status="full", missing_information=[], target_complete=True,
+                summary="两座城市天气均已取得。",
+            )
+
+    class Gateway:
+        def __init__(self):
+            self.calls = 0
+
+        async def call_tool(self, agent, tool_name, arguments, **kwargs):
+            self.calls += 1
+            return ToolObservation(
+                call_id=f"call-{self.calls}", decision_id=kwargs["decision_id"], task_id=kwargs["task_id"],
+                agent=agent, tool_name=tool_name, arguments=arguments, status=ToolCallStatus.SUCCEEDED,
+                result_summary=f"{arguments['city']} 天气已取得。",
+            )
+
+    adapter, gateway = SettlementAdapter(), Gateway()
+    context = AgentContext(
+        decision_id="d", gateway=gateway, memory=MemoryContext(), model_adapter=adapter,
+        request=DecisionRequest(query="比较南京和苏州周末旅游"),
+    )
+    asyncio.run(BaseReActAgent().execute(
+        TaskSpec(task_id="weather", objective="比较周末天气", agent=AgentName.EVIDENCE_RESEARCH), context,
+    ))
+
+    assert gateway.calls == 2
+    assert adapter.settlement_calls == 2
+    assert context.information_targets[0]["status"] == "complete"

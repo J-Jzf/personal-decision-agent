@@ -2,7 +2,8 @@
 
 from .base import AgentContext, BaseReActAgent, ToolAction
 from .judge import DecisionJudge
+from .general import GeneralAgent
 from .planner import Planner
 from .risk_critic import RiskCritic
 
-__all__ = ["AgentContext", "BaseReActAgent", "DecisionJudge", "Planner", "RiskCritic", "ToolAction"]
+__all__ = ["AgentContext", "BaseReActAgent", "DecisionJudge", "GeneralAgent", "Planner", "RiskCritic", "ToolAction"]
