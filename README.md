@@ -4,7 +4,7 @@
 
 - **后端：** Python 3.10+、FastAPI、Pydantic v2、Uvicorn。
 - **模型：** OpenAI 兼容 Chat Completions；通过 `response_format={"type":"json_object"}` 和 Pydantic 合同取得结构化输出。
-- **Agent 编排：** 项目内实现的可持久化 Plan-and-Execute、增量重规划和专家 ReAct 循环；不使用 LangGraph。
+- **Agent 编排：** 项目内实现的可持久化 Plan-and-Execute、增量重规划和专家 ReAct 循环（多专家，多 agent 系统）；不使用 LangGraph。并设计每个任务场景可用的 skills。
 - **工具：** MCP stdio JSON-RPC、运行时工具发现、工具 JSON Schema 子集校验和只读策略。
 - **数据：** 本地 SQLite（权威记录、检查点、审计和记忆）与嵌入式 Qdrant `QdrantClient(path="var/qdrant")`（可重建 Episode 向量索引）。
 - **前端：** React 18、TypeScript、Vite、Vitest；浏览器使用 HTTP SSE 接收公开 Trace。
@@ -599,6 +599,23 @@ Gateway 完成一次调用后先产生：
 ## 自主规划、重规划与 HITL
 
 总控输出 `AutonomousPlan`。Prompt 包含完整 JSON Schema、字段合同、6 个决策类型、8 个 Skill、允许专家及每名专家当前可用的工具/Schema。模型必须只返回 JSON；Pydantic 校验失败时会收到上次错误和无效输出，最多修复 5 次。专家 ReAct、信息目标计划、裁判和证据关系判断也使用相同的“Schema + 最多五次修复”模式。结构化修复预算不占 MCP、重规划或 HITL 次数。
+
+### Planner 如何分配 Agent 与 Skill
+
+模型优先在 `AutonomousPlan` 中同时选择 `decision_type`、`skill_name` 和每项 `TaskSpec` 的 `objective`、`agent`、依赖、完成条件与所需 capability。Planner 不直接相信这份分配：它先确认 `skill_name` 是当前 `SkillRegistry` 已加载的名称，再检查 Agent 位于执行目录中；随后以 objective 是否包含该 Agent 的职责关键词，判断其真实 `execute()` 是否能够完成该任务。当前目录为：
+
+| Agent | 真实执行职责 | 目标关键词示例 |
+|---|---|---|
+| `evidence_research` | 检索和整理外部网页、地点、事实资料 | 检索、证据、网页、资料、事实、研究 |
+| `financial_market` | 检索和分析市场、价格、持仓、财务资料 | 市场、金融、财务、价格、股票、基金、持仓 |
+| `location_lifestyle` | 检索地点、路线、天气、生活方式资料 | 地点、路线、天气、通勤、城市、旅行、生活方式 |
+| `preference` | 仅读取、提取、匹配用户显式偏好与长期记忆 | 偏好、记忆、画像、匹配 |
+| `risk_critic` | 规则式检查硬约束、证据缺口、反例与过度结论 | 风险、约束、反例、缺口、审查 |
+| `general` | 一次结构化 LLM 调用，综合、比较、归纳或推荐 | 兜底；无需关键词匹配 |
+
+若模型选中的专门 Agent 与 objective 不匹配，Planner 改派 `general`，而非让不具备相应 `execute()` 逻辑的 Agent 伪装完成任务。`required_capabilities` 还会与“本次运行时发现的工具能力”及该 Agent 在执行目录中允许的能力取交集；交集外的能力会被移除。`general` 没有 MCP capability，职责是整合已有的任务执行上下文、记忆和用户约束，不直接检索外部资料。
+
+Skill 不是强制的静态路由。总控模型在 Prompt 提供的 8 个 Skill 中选择一个可用 `skill_name`，并参考该 Skill 的推荐 Agent/工具、分析维度、工作流、风险检查和完成条件来形成任务图；Planner 仅接受实际已加载的 Skill 名。模型不可用时，`Planner.create_plan()` 使用本地保守规则：基础任务是 `evidence_research` 与 `preference`；投资组合/金融关键词会加入 `financial_market`，旅行或地点关键词会加入 `location_lifestyle`，再合并所选 Skill 的 `recommended_agents`；最后总会加入依赖此前任务的 `general` 与 `risk_critic`。每个本地任务的推荐工具来自 Skill 的 `recommended_tools`，但仍会经过该 Agent 的能力过滤。
 
 每轮 ReAct 的 `execution_context.react_context` 是严格的 target-local 视图：用户问题、Task（ID 与 objective）、当前 target、当前 target 的 `completion_criteria`、该 target 的历史 Observation、`latest_summary`、当前覆盖状态、`missing_information`、两类剩余额度、当前专家的允许工具，以及必要的 `MemoryContext` 与 HITL 补充。适配器会过滤掉其他 target 的状态、摘要、缺口、观察与证据；即使全局 `DecisionState` 仍保存它们，ReAct 也不会收到。失败 Observation 在状态与 Trace 中可审计；当前实现会将当前 target 最近失败的 `error` 额外标为“上一轮失败原因”，但不会把其他 target 的失败暴露给它。
 
