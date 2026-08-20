@@ -114,6 +114,158 @@ POST /decision 或 POST /decision/stream
   -> 返回报告、计划、激活专家、Trace 和同一 decision_id
 ```
 
+### 主链路
+
+Plan-and-Execute 总控 → 专家内部 ReAct → Information Target → MCP → Observation 语义核验 → Target Settlement → Evidence/Findings → 总控摘要 → Replan/Verify → Judge 最终整合 → Memory/Archive
+
+`DecisionGraph._run()` 是整个总工作流的主干，专家执行后还会把结果、覆盖状态、工具观察、Evidence、progress summary 都重新汇总到总状态里。
+
+并且做了以下设计：
+- MCP 成功 ≠ 内容可用，还会做 semantic assessment。
+- partial 不会被直接丢掉（获得的结果是 partial，也会进入总控的逐步摘要和最后的整合）。
+- complete 不允许被后来的 partial 降级。
+- 跨目标资料与“直接支持当前目标”的资料做了区分。
+- 每个信息 target 有独立 MCP 调用额度。
+- completed_with_gaps 可以继续下游综合，同时把缺口公开出来。
+- 最终 Judge 不是只看最后一个 Agent，而是拿到 progress summaries、Evidence、coverage、memory 等整体上下文。
+
+整个 Agent 从头到尾的简单逻辑：
+
+```text
+用户问题
+   ↓
+识别决策类型
+   ↓
+读取相关记忆
+   ↓
+选择 Skill
+   ↓（可选 HITL）
+Planner 制定任务 DAG
+   ↓
+按依赖执行各专家
+   ↓
+ReAct 专家：
+拆目标 → 调 MCP → 检查结果 → 补资料
+   ↓
+每个专家输出 findings + uncertainties
+   ↓
+总控逐步汇总
+   ↓
+必要时 Replan
+   ↓
+必要时 Evidence Verification / Debate
+   ↓
+Judge 综合所有资料
+   ↓
+最终推荐
+   ↓
+保存轨迹、报告、工作状态和记忆
+```
+
+ReAct 专家 Agent 从头到尾的简单逻辑：
+
+```text
+收到一个 Task
+   ↓
+把 Task 拆成若干 Information Target
+   ↓
+选当前 Target
+   ↓
+LLM 看当前状态决定下一步
+   ↓
+call_tool / finish / replan / human input
+   ↓
+如果 call_tool：
+调用 MCP
+   ↓
+压缩工具结果
+   ↓
+判断结果是否支持当前 Target
+   ↓
+有用 → 写 Evidence Ledger
+   ↓
+Settlement 判断：
+继续搜？
+还是 complete / partial 结束？
+   ↓
+未结束 → 再一轮 ReAct
+结束 → 下一个 Target
+   ↓
+所有 Target 完成
+   ↓
+汇总 findings / uncertainties
+   ↓
+返回
+completed / completed_with_gaps / blocked
+```
+
+LLM ReAct 决定下一动作
+
+它可以：
+
+```text
+call_tool
+finish
+request_replan
+request_human_input
+```
+
+而且会看到非常多公开上下文：
+
+```text
+当前任务
+当前 target
+所有 target
+当前任务此前所有调用
+成功资料
+information coverage
+全局 missing info
+其他已完成任务
+Evidence Ledger
+Memory
+```
+
+#### 三个 ReAct 专家
+
+三个 ReAct 专家的区别主要只是工具域，真正的执行逻辑都在 BaseReActAgent。PreferenceAgent 和 RiskCritic 虽然继承 BaseReActAgent，但它们重写了 execute()，所以实际并不走这个 ReAct 流程。
+
+EvidenceResearchAgent 负责通用外部事实/网页/地点资料，主要允许：
+
+```text
+web_search
+fetch_page
+place_search
+```
+
+LocationLifestyleAgent 主要允许：
+
+```text
+web_search
+fetch_page
+place_search
+route_search
+weather_forecast
+```
+
+负责：
+
+```text
+地点
+路线
+天气
+生活方式
+```
+
+FinancialMarketAgent 负责金融市场数据，主要允许：
+
+```text
+web_search
+fetch_page
+market_data
+```
+
+实际的 ReAct 状态机基本完全相同。
+
 ### 阶段 JSON 合同、状态值与去向
 
 以下是当前代码在一次请求中使用的全部关键 JSON 合同。所有模型输出都先经过 Pydantic 校验；模型输出的原始文本和私有思维链不会保存或发送给前端。这里的“传递”指经 `DecisionState` 组装为下一阶段的公开上下文；`working_memories.state_json` 会保存可恢复的状态快照。
@@ -702,6 +854,10 @@ Invoke-RestMethod -Method Post `
 9. **比较/归纳目标没有自己的工具调用而被阻塞：** 过去框架只承认当前目标的本地观察；例如已分别获得两项资料后，“比较两者”这一目标没有必要再调用工具，却会因没有本地观察而无法完成。现在语义核验通过的资料会进入同一 `decision_id` 的可引用证据账本，专家可在 `TargetResolution.evidence_refs` 指向这些 `call_id`，并以 `conservative_inference` 完成比较或归纳目标。
 10. **有可用资料却因普通缺口阻塞整个下游：** 过去一个专家在额度耗尽前已得到部分可靠资料，任务仍会被统一标成 `blocked`，导致后续综合任务无法使用它。现在框架区分“完全缺乏可用资料”的 `blocked` 与“可继续综合、但有缺口”的 `completed_with_gaps`；后者的已核验发现、缺口和证据都会传给总控、核验器、裁判与前端 Trace。
 11. **专家 ReAct 可能漏写关键结算字段：** 过去工具结果已语义核验为 `relevant` 或 `partial` 后，仍依赖下一轮 ReAct 主动输出 `coverage_updates` 或 `target_resolution`，目标可能因此漂移。现在把结算从 ReAct 中拆出：每条语义可用观察都会立即进入专用结算 LLM，注入专用 JSON Schema、当前子目标、工具调用与结果、语义核验、已有观察和覆盖状态；它不接收完成条件，并允许保守推断。系统立刻校验并写入当前目标；无效输出只保留观察和失败 Trace，不伪造完成状态。
+
+
+**问题：** 当前 ReAct 专家的短期工作记忆如果主要按“上一轮调用了什么工具、返回了什么 Observation”的流水账方式组织，模型虽然看到了历史，却没有形成清晰的“任务状态认知”，因此容易出现重复搜索、误判缺口和被失败记录持续干扰的问题。结合当前实现，一个 `task` 会被拆成多个 information target，模型实际上需要持续知道“总 task 要完成什么、当前有哪些 target、当前正在处理哪一个、前面的 target 是否已经 complete/partial、每个已完成 target 的结论是什么及依据哪些有效 Observation 得出、当前 target 已经获得了哪些有效证据、还缺哪些 completion criteria、下一步究竟应该补什么”，而不是反复读取完整工具调用历史。例如三个 target 中前两个已经搜完，当前执行第二个或第三个时，如果上下文只是罗列此前 Observation，模型很容易看到“还没有最后一个 target 的信息”，便错误地把它当成**当前 target 的证据不足**，从而继续重复搜索已经完成的当前内容；同样，工具调用失败、返回失败或语义不相关的结果如果长期保留在滚动上下文中，模型会不断把历史失败当成最近仍在发生的问题，进入过度防御状态，反复换关键词、规避工具或重新验证已经解决的问题。**解决方式：** 将短期工作记忆从“事件流水账”改造成“结构化任务状态 + 极短近期事件”的上下文工程：为 ReAct 每一轮显式提供 `task objective → target plan → current target → 已完成 target 摘要 → current target 当前覆盖状态 → 已获得的有效证据及来源 → completion_criteria 逐项满足情况 → missing_information → 当前下一步目标`，其中已完成 target 只保留压缩后的最终状态和结论，不再反复暴露其全部搜索过程；当前 target 的成功 Observation 才持续累积进入工作记忆，并由 Settlement 不断更新“已满足什么、还缺什么”，使模型下一轮直接围绕缺口行动，而不是自行从历史记录重新推断进度。失败信息则采用**短生命周期机制**：某次调用失败、无结果或不相关时，只在紧接着的下一轮提供完整失败详情和拒绝原因，帮助 ReAct 修正动作；之后删除原始失败结果，只在一个简短的 `avoid/retry_notes` 中保留抽象经验，例如“上一查询过窄，无有效结果”“city=Nanjing 与当前苏州 target 不匹配”“该工具本 target 已失败一次”，避免失败内容长期污染推理。与此同时，必须把“全局任务缺口”和“当前 target 缺口”严格分离：其他尚未执行 target 缺信息是正常状态，不能作为当前 target 未完成的依据；ReAct 只依据当前 target 的 `completion_criteria + accumulated evidence + missing_information` 决定是否继续搜索，当前 target 一旦 complete 或额度耗尽后结算为 partial/blocked，就单向进入下一个 target，不再因为看到后续 target 尚未完成而回头重复搜索。这样工作记忆实际上不再回答“之前发生过什么”，而主要回答四件事：**整个任务要做什么、现在做到哪里、已经确认了什么、当前还缺什么**，工具调用历史只作为辅助证据来源存在。
+
 
 ## Agent 测评与未来完善
 
