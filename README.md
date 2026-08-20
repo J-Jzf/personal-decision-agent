@@ -256,7 +256,7 @@ request_human_input
 
 ```text
 当前任务
-用户问题、当前 task ID、当前 target、completion_criteria、当前 target observations、latest_summary、coverage、missing_information、剩余额度、允许工具和必要 Memory/HITL
+用户问题、当前 target、completion_criteria、当前 target observations、latest_summary、coverage、missing_information、剩余额度、允许工具和必要 Memory/HITL
 ```
 
 #### 三个 ReAct 专家与一个通用 Agent
@@ -302,7 +302,7 @@ market_data
 
 对于总控全局信息，
 - General Agent：普通 General task 可读取总控提供的执行上下文；终局 General 就是普通 General，因 `source_target_ids=[]` 而读取完整的总控任务账本、已完成 task 结论、有效 Evidence、覆盖/target 结算、最终缺口和最新 Progress Summary，并可按原有上限委派事实专家；由 `downstream_handoffs` 创建的 General task 则只读取声明上游 target 的有效资料、结算摘要和最终缺口，不读取无关任务或失败历史。
-- ReAct 三个检索专家：在生成 Information Plan 时可以看到总控传入的执行上下文；但真正进入每个 target 的 ReAct 执行后，只保留当前 task ID、当前 target、当前 target 历史/缺口和必要记忆，不会看到 `TaskSpec.objective`、其他 target 的全局细节。
+- ReAct 三个检索专家：在生成 Information Plan 时可以看到总控传入的执行上下文；但真正进入每个 target 的 ReAct 执行后，只保留用户问题、当前 target、当前 target 历史/缺口和必要记忆，不会看到 `TaskSpec` 的任何元数据、用户候选项或其他 target 的全局细节。
 - Preference / RiskCritic：走各自独立的 execute()，不是统一的 ReAct 隔离逻辑；它们能看到什么取决于各自 execute() 传了哪些 context。
 
 ### 阶段 JSON 合同、状态值与去向
@@ -788,7 +788,7 @@ Controller
 
 ReAct、参数绑定预检、ObservationAssessment 与 Target Settlement 则各有更窄的输入边界：
 
-- ReAct 只处理当前 target，使用用户问题、task ID（不含 objective）、该 target 的完成条件、局部 Observation、累计覆盖/摘要/缺口、两类剩余额度、允许工具和必要的用户约束、Memory/HITL；不接收其他 target 的详情。
+- ReAct 只处理当前 target，使用用户问题、该 target 的完成条件、局部 Observation、累计覆盖/摘要/缺口、两类剩余额度、允许工具和必要的用户约束、Memory/HITL；不接收 `TaskSpec` 的任何元数据、用户候选项或其他 target 的详情。
 - 参数绑定预检只判断“拟调用的工具参数是否能补齐当前 target 的某项未满足 criterion”；语义核验只判断“已返回的 Observation 是否支持当前 target”；Settlement 只按该 target 的累计有效 Observation 核对该 target 的完成条件。
 - 当前 target 中成功且 `supports_current_target=true` 的 Observation 会持续累计；Settlement 会回写 `latest_summary`、coverage、逐项 `criteria` 和 `missing_information`，使下一轮 ReAct 可直接围绕未满足条件行动。失败、无关或旁路 Observation 仍留在完整状态和 Trace 供审计；预检或 ReAct 修正提示只在同 target 的下一轮出现一次，不会跨 target 或 task 传播。
 

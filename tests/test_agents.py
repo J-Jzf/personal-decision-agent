@@ -43,7 +43,7 @@ def test_react_context_is_limited_to_the_active_target_and_its_history():
     assert view["当前 target 已有 observations"][0]["status"] == "failed"
     assert view["当前 target latest_summary"] == "苏州温度已取得"
     assert view["当前 target missing_information"] == ["苏州降雨"]
-    assert view["Task"] == {"task_id": "weather"}
+    assert "Task" not in view
     assert task.objective not in str(view)
     assert "所有 target" not in view
     assert "所有任务" not in view

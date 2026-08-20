@@ -272,8 +272,12 @@ def test_react_repairs_invalid_json_with_schema_tool_reference_and_user_informat
     async def scenario():
         adapter = ModelAdapter(Settings(llm_model_id="fake", llm_api_key="key"), client=RepairingReactClient())
         decision = await adapter.react_or_fallback(
-            task=TaskSpec(task_id="weather", objective="查询天气", agent=AgentName.LOCATION_LIFESTYLE),
-            request=DecisionRequest(query="这周末上海天气如何？"),
+            task=TaskSpec(
+                task_id="react-hidden-task-id", objective="查询天气", agent=AgentName.LOCATION_LIFESTYLE,
+                dependencies=["upstream-task"], required_capabilities=["weather_forecast"],
+                allow_factual_delegation=True,
+            ),
+            request=DecisionRequest(query="这周末上海天气如何？", candidates=["仅供上游候选-南京", "仅供上游候选-苏州"]),
             memory=MemoryContext(), observations=[],
             tools=[ToolDescriptor(
                 name="weather", capability="weather_forecast", description="查询指定城市和日期的天气预报",
@@ -300,6 +304,10 @@ def test_react_repairs_invalid_json_with_schema_tool_reference_and_user_informat
         assert "上海 8 月 23 日天气" in calls[0]["messages"][1]["content"]
         assert "用户问题" in calls[0]["messages"][1]["content"]
         assert "查询天气" not in calls[0]["messages"][1]["content"]
+        assert "react-hidden-task-id" not in calls[0]["messages"][1]["content"]
+        assert "upstream-task" not in calls[0]["messages"][1]["content"]
+        assert "仅供上游候选-南京" not in calls[0]["messages"][1]["content"]
+        assert "仅供上游候选-苏州" not in calls[0]["messages"][1]["content"]
         assert "当前 target completion_criteria" in calls[0]["messages"][1]["content"]
         assert "当前 target 已有 observations" in calls[0]["messages"][1]["content"]
         assert "信息达到可支持结论的参考程度即可" in calls[0]["messages"][0]["content"]

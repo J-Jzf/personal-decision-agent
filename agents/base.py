@@ -563,7 +563,6 @@ class BaseReActAgent:
         hitl = context.request.context.get("hitl", {}) if context.request is not None else {}
         return {
             "用户问题": context.request.query if context.request is not None else "",
-            "Task": {"task_id": task.task_id},
             "当前 target": active_target,
             "当前 target completion_criteria": list(active_target.get("completion_criteria", task.completion_criteria)),
             "当前 target 已有 observations": prompt_history,
