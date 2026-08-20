@@ -499,22 +499,11 @@ class BaseReActAgent:
         return history
 
     async def finish(self, task: TaskSpec, context: AgentContext, used: int) -> AgentResult:
-        """按可用资料和剩余缺口结算专家任务，避免局部不足抹掉已取得结论。"""
+        """按最终 target 结算缺口输出专家结果；调用失败仅保留在 Trace。"""
         successes = [item for item in context.observations if item.task_id == task.task_id and self._is_semantically_usable(item)]
         incomplete_targets = [item for item in context.information_targets if item.get("status") != "complete"]
-        incomplete_ids = {str(item.get("target_id")) for item in incomplete_targets}
-        failures = [
-            item for item in context.observations
-            if item.task_id == task.task_id and item.target_id in incomplete_ids
-            and item.status != ToolCallStatus.SUCCEEDED
-        ]
-        uncertainties = [item.error or f"{item.tool_name} 不可用" for item in failures]
-        uncertainties.extend(
-            item.semantic_summary or f"{item.tool_name} 返回内容未通过当前目标的语义核验"
-            for item in context.observations
-            if item.task_id == task.task_id and item.target_id in incomplete_ids and item.status == ToolCallStatus.SUCCEEDED
-            and item.semantic_status in {ObservationRelevance.IRRELEVANT, ObservationRelevance.UNVERIFIABLE}
-        )
+        # AgentResult 是总控的长期工作输入，只保留最终仍未满足的目标条件；原始失败留在 observations/Trace 审计。
+        uncertainties: list[str] = []
         if context.replan_reason:
             uncertainties.append(context.replan_reason)
         if incomplete_targets:

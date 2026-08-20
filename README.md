@@ -126,7 +126,7 @@ POST /decision 或 POST /decision/stream
 
 Plan-and-Execute 总控 → 专家内部 ReAct → 当前 Information Target → 参数绑定预检 → MCP → Observation 语义核验 → 当前 Target Settlement → Evidence/Findings → 总控摘要 → Replan/Verify → Judge 最终整合 → Memory/Archive
 
-`DecisionGraph._run()` 是整个总工作流的主干，专家执行后还会把结果、覆盖状态、工具观察、Evidence、progress summary 都重新汇总到总状态里。
+`DecisionGraph._run()` 是整个总工作流的主干，专家执行后还会把结果、覆盖状态、工具观察、Evidence、progress summary 都重新汇总到总状态里。完整 Observation（包括失败）用于 Trace 与审计；总控长期摘要只读取最终 target 结算出的未解决缺口。
 
 并且做了以下设计：
 - MCP 成功 ≠ 内容可用，还会做 semantic assessment。
@@ -335,7 +335,7 @@ market_data
 }
 ```
 
-这是总控 LLM 的首次输出，也是重规划时复用的同一合同。`task_id` 在一个 `plan.tasks` 内唯一；`dependencies` 只能引用同一计划内存在的任务，且不能引用自身。执行器按 `plan.tasks` 的列表顺序执行，只有前置任务已经 `completed` 或 `completed_with_gaps` 才运行；未满足依赖的任务会标为 `skipped`，交给重规划或最终判断。当前合同尚未做完整的拓扑排序或依赖环检测。`agent` 只能从六种专家中选择；Planner 再用执行目录同时核验该 Agent 的实际执行方式、目标关键词与允许 capability，不匹配的任务会改派 `general`。每个 ReAct 任务能否调用工具，还受 MCP 注册表的 `allowed_agents`、能力和工具 Schema 约束。其 `plan` 会写入 `DecisionState.plan`、任务账本、`plan_created`/`plan_replanned` Trace、SQLite checkpoint 和最终归档的 `decision_archives.plan_json`；`planning_summary` 用于前端公开轨迹。
+这是总控 LLM 的首次输出，也是重规划时复用的同一合同。`task_id` 在一个 `plan.tasks` 内唯一；`dependencies` 只能引用同一计划内存在的任务，且不能引用自身。执行器按 `plan.tasks` 的列表顺序执行，只有前置任务已经 `completed` 或 `completed_with_gaps` 才运行；未满足依赖的任务会标为 `skipped`，交给重规划或最终判断。当前合同尚未做完整的拓扑排序或依赖环检测。`agent` 只能从六种专家中选择；Planner 用显式 `work_kind`、Agent 执行契约与允许 capability 核验该 Agent 的实际 `execute()` 能力，不匹配时改派 `general`。每个 ReAct 任务能否调用工具，还受 MCP 注册表的 `allowed_agents`、能力和工具 Schema 约束。其 `plan` 会写入 `DecisionState.plan`、任务账本、`plan_created`/`plan_replanned` Trace、SQLite checkpoint 和最终归档的 `decision_archives.plan_json`；`planning_summary` 用于前端公开轨迹。
 
 `status` 这里是计划任务的初始/账本状态；真正的专家结果使用下面的 `AgentResult.completion_status`。`completed` 与 `completed_with_gaps` 都能解除普通下游依赖：后者会连同公开缺口进入综合与最终报告。`blocked`、`failed`、`skipped` 没有可用资料，不能解除依赖。
 
@@ -429,13 +429,13 @@ market_data
 
 #### 7. 调用前参数绑定预检：`ToolBindingAssessment`
 
-每次 ReAct 选择 `call_tool` 后、Gateway 之前，框架以独立的结构化 LLM 调用执行预检：
+每次 ReAct 选择 `call_tool` 后、Gateway 之前，框架以独立的结构化 LLM 调用执行预检。它不要求这一次调用独立完成整个 target，而是判断其参数能否实质帮助当前 target 的**至少一项尚未满足 completion criterion**：
 
 ```json
 {"bound": true, "reason": ""}
 ```
 
-预检只接收用户请求、当前 Task、当前 target（含 `completion_criteria`）、选中工具的名称/说明/input schema 与拟调用参数；不接收其他 target 的状态、观察、摘要或缺口。`bound=false` 时 `reason` 必填，框架写入当前 target 的一次性修正提示和失败 Observation，下一轮同 target ReAct 消费后即清除；通过时也清除该提示。预检不触发 Gateway、不会消耗 MCP 调用额度；每个 target 最多 6 次。
+预检只接收用户请求、当前 Task、当前 target 的未满足 criterion（以及已结算 criterion 的满足状态）、选中工具的名称/说明/input schema 与拟调用参数；不接收其他 target 的状态、观察、摘要或缺口。已满足 criterion 不能作为 `bound=true` 的理由；只要能补齐任意一个未满足 criterion 即应通过。`bound=false` 时 `reason` 必填，框架写入当前 target 的一次性修正提示和失败 Observation，下一轮同 target ReAct 消费后即清除；通过时也清除该提示。预检不触发 Gateway、不会消耗 MCP 调用额度；每个 target 最多 6 次。
 
 #### 8. MCP 调用与语义核验：`ToolObservation`、`TraceSummary`、`ObservationAssessment`
 
@@ -525,14 +525,14 @@ Gateway 完成一次调用后先产生：
   "summary": "公开任务摘要",
   "evidence_ids": ["关联证据 ID"],
   "findings": ["通过语义核验的发现"],
-  "uncertainties": ["失败、无关、无法核验或未覆盖项"],
+  "uncertainties": ["最终仍未满足的 completion criteria 或无法消除的公开缺口"],
   "tool_calls_used": 0,
   "completion_status": "pending | running | completed | completed_with_gaps | failed | blocked | skipped",
   "created_at": "UTC ISO-8601 时间"
 }
 ```
 
-它保存到 SQLite `agent_results`、任务账本、`DecisionState.agent_results`、`agent_task_completed` Trace 和 checkpoint。`completed` 代表资料充分完成；`completed_with_gaps` 代表已有可用资料、但仍保留普通缺口，二者都可解除**普通** DAG 依赖并进入下游综合；`blocked` 表示没有可用资料或无法完成，不能解除依赖；其余状态分别表示未开始、运行中、失败、跳过。每个任务结束后框架还生成并保存/展示 `controller_progress_summary`：`{"用户问题":..., "为完成这一问题计划的全部任务有":[...], "目前已完成的任务有":[...], "目前得到的信息":[...], "仍缺少或存在冲突的信息":[...], "下一步应该做":...}`；它会进入之后的专家、重规划和裁判上下文。
+它保存到 SQLite `agent_results`、任务账本、`DecisionState.agent_results`、`agent_task_completed` Trace 和 checkpoint。`completed` 代表资料充分完成；`completed_with_gaps` 代表已有可用资料、但仍保留普通缺口，二者都可解除**普通** DAG 依赖并进入下游综合；`blocked` 表示没有可用资料或无法完成，不能解除依赖；其余状态分别表示未开始、运行中、失败、跳过。`uncertainties` 只承载任务结束时仍未解决的 target 缺口，不回放已经修复的参数错误、失败调用或无关 Observation；这些完整历史只保留在 Trace/Observation 审计。每个任务结束后框架还生成并保存/展示 `controller_progress_summary`：`{"用户问题":..., "为完成这一问题计划的全部任务有":[...], "目前已完成的任务有":[...], "目前得到的信息":[...], "仍缺少或存在冲突的信息":[...], "下一步应该做":...}`；它仅从 target 的最终 `missing_information`（无 target 任务才使用其公开 uncertainties）汇总缺口，并进入之后的总控、重规划和裁判上下文。
 
 #### 11. 总控是否重规划：`ReplanDecision`
 
@@ -545,11 +545,11 @@ Gateway 完成一次调用后先产生：
 }
 ```
 
-这是执行完当前计划后总控 LLM 的结构化判断，而不是“只要有不确定性就重规划”的规则。只有 `should_replan=true`、`critical_gaps` 非空且 `can_execute_remedy=true` 才进入重规划；否则普通缺口留给核验和最终报告。它读取任务账本、目标结算、语义无关/失败观察、Evidence、覆盖状态和总控进度摘要，临时保存于 `DecisionState.replan_decision`、checkpoint 及 `REPLANNING` 状态 Trace。若要重规划，总控再输出第 2 节的增量 `AutonomousPlan`，框架防御性移除已完成任务。
+这是执行完当前计划后总控 LLM 的结构化判断，而不是“只要有不确定性就重规划”的规则。只有 `should_replan=true`、`critical_gaps` 非空且 `can_execute_remedy=true` 才进入重规划；否则普通缺口留给核验和最终报告。它读取任务账本、目标结算、Evidence、覆盖状态和总控进度摘要；原始失败 Observation 仍可在 Trace 审计，但不会作为长期缺口注入重规划上下文。结果临时保存于 `DecisionState.replan_decision`、checkpoint 及 `REPLANNING` 状态 Trace。若要重规划，总控再输出第 2 节的增量 `AutonomousPlan`，框架防御性移除已完成任务。
 
 #### 12. 裁判、归档、画像与前端 Trace：`DecisionReport`、`WorkflowEvent`、`DecisionResponse`
 
-裁判 LLM 输出最终 `DecisionReport`：
+裁判 LLM 输出最终 `DecisionReport`。在输出 JSON 前，Prompt 要求它检查推荐、事实、推断、取舍、风险和不确定性是否互相矛盾；每条事实性理由都必须可追溯到 Evidence 或明确标注为推断。“未找到证据”只能结论为尚未证实，绝不能写成该事实不存在：
 
 ```json
 {
@@ -622,11 +622,11 @@ Gateway 完成一次调用后先产生：
 
 Skill 不是强制的静态路由。总控模型在 Prompt 提供的 8 个 Skill 中选择一个可用 `skill_name`，并参考该 Skill 的推荐 Agent/工具、分析维度、工作流、风险检查和完成条件来形成任务图；Planner 仅接受实际已加载的 Skill 名。模型不可用时，`Planner.create_plan()` 使用本地保守规则：基础任务是 `evidence_research` 与 `preference`；投资组合/金融关键词会加入 `financial_market`，旅行或地点关键词会加入 `location_lifestyle`，再合并所选 Skill 的 `recommended_agents`；最后总会加入依赖此前任务的 `general` 与 `risk_critic`。每个本地任务的推荐工具来自 Skill 的 `recommended_tools`，但仍会经过该 Agent 的能力过滤。
 
-每轮 ReAct 的 `execution_context.react_context` 是严格的 target-local 视图：用户问题、Task（ID 与 objective）、当前 target、当前 target 的 `completion_criteria`、该 target 的历史 Observation、`latest_summary`、当前覆盖状态、`missing_information`、两类剩余额度、当前专家的允许工具，以及必要的 `MemoryContext` 与 HITL 补充。适配器会过滤掉其他 target 的状态、摘要、缺口、观察与证据；即使全局 `DecisionState` 仍保存它们，ReAct 也不会收到。失败 Observation 在状态与 Trace 中可审计；当前实现会将当前 target 最近失败的 `error` 额外标为“上一轮失败原因”，但不会把其他 target 的失败暴露给它。
+每轮 ReAct 的 `execution_context.react_context` 是严格的 target-local 视图：用户问题、Task（ID 与 objective）、当前 target、当前 target 的 `completion_criteria`、该 target 的历史 Observation、`latest_summary`、当前覆盖状态、`missing_information`、两类剩余额度、当前专家的允许工具，以及必要的 `MemoryContext` 与 HITL 补充。适配器会过滤掉其他 target 的状态、摘要、缺口、观察与证据；即使全局 `DecisionState` 仍保存它们，ReAct 也不会收到。完整失败 Observation 只在状态与 Trace 中审计；仅预检或 ReAct 合同修正的当前 target 错误会作为一次性 `react_validation_error` 进入紧接着的下一轮，然后被清除，不会跨 target、task 或进入总控长期摘要。
 
 每次 MCP 返回 `succeeded` 后，`ObservationAssessment` 只依据用户问题、当前 Task、当前 target（含完成条件）、本次参数与结果，判定内容和当前 target 的关系；这不是关键词匹配或简单规则。`irrelevant` 仅用于完全无关且无法合理推断的结果；相关但不完整的资料应为 `partial`。`supports_current_target=false` 与 `related_target_ids` 只记录旁路关联，不污染当前目标，也不会自动改变其他 target。只有直接支持当前 target 的 `relevant` / `partial` Observation 进入 Settlement；Settlement 每次只看当前 target 的累计可用 Observation，逐项检查完成条件。ReAct 不生成 `coverage_updates`，也不能以 `finish` 提前结算目标。complete 后立即切换下一个目标；partial 会继续当前目标直到 complete 或额度耗尽。若专家已有可用资料但仍有普通缺口，任务结果为 `completed_with_gaps`，可作为普通下游综合的依赖，并由总控决定是否重规划。
 
-重规划上限为 `REPLAN_LIMIT`（默认 3）。出现未完成资料时，`ReplanDecision` 由总控 LLM 结构化判断：只有缺口可能实质改变推荐、硬约束或关键风险，且允许专家/工具可执行补救，才会重规划。它收到任务账本、目标结算、语义无关/失败观察、Evidence 与覆盖状态；计划只应包含尚未满足的任务。模型不可用时采用保守降级：保留缺口并进入核验或最终判断，不会因任意 `uncertainties` 自动循环。执行器仍会防御性移除已完成任务与其依赖。
+重规划上限为 `REPLAN_LIMIT`（默认 3）。出现未完成资料时，`ReplanDecision` 由总控 LLM 结构化判断：只有缺口可能实质改变推荐、硬约束或关键风险，且允许专家/工具可执行补救，才会重规划。它收到任务账本、最终目标结算、Evidence 与覆盖状态；计划只应包含尚未满足的任务。工具失败、预检拒绝和无关 Observation 仅留在 Trace，不会作为总控的长期“仍缺少信息”。模型不可用时采用保守降级：保留缺口并进入核验或最终判断，不会因任意 `uncertainties` 自动循环。执行器仍会防御性移除已完成任务与其依赖。
 
 HITL 请求由 `hitl_requested` Trace 事件携带。页面在该事件下显示表单与倒计时；提交调用 `POST /decision/{id}/hitl/{request_id}`，跳过或超时也会恢复流程。填写内容只进入当前状态的 `request.context.hitl`、画像候选原文和之后的模型输入。
 
@@ -732,7 +732,7 @@ Gateway 只注册可映射为 `web_search`、`fetch_page`、`place_search`、`ro
 ReAct、参数绑定预检、ObservationAssessment 与 Target Settlement 则各有更窄的输入边界：
 
 - ReAct 只处理当前 task 的当前 target，使用该 target 的完成条件、局部 Observation、累计覆盖/摘要/缺口、两类剩余额度、允许工具和必要的用户约束、Memory/HITL；不接收其他 target 的详情。
-- 参数绑定预检只判断“拟调用的工具参数是否服务当前 target”；语义核验只判断“已返回的 Observation 是否支持当前 target”；Settlement 只按该 target 的累计有效 Observation 核对该 target 的完成条件。
+- 参数绑定预检只判断“拟调用的工具参数是否能补齐当前 target 的某项未满足 criterion”；语义核验只判断“已返回的 Observation 是否支持当前 target”；Settlement 只按该 target 的累计有效 Observation 核对该 target 的完成条件。
 - 当前 target 中成功且 `supports_current_target=true` 的 Observation 会持续累计；Settlement 会回写 `latest_summary`、coverage、逐项 `criteria` 和 `missing_information`，使下一轮 ReAct 可直接围绕未满足条件行动。失败、无关或旁路 Observation 仍留在完整状态和 Trace 供审计；预检或 ReAct 修正提示只在同 target 的下一轮出现一次，不会跨 target 或 task 传播。
 
 这种分层把“全局还缺什么”和“当前 target 还缺什么”分开：前者只影响 Controller/Replan/Judge，后者才决定当前 ReAct 是否继续调用工具。系统目前保留当前 target 的局部历史以便可审计和避免重复；它没有实现独立的 `avoid/retry_notes` 压缩表，因此文档不把该机制描述为现有功能。
@@ -944,7 +944,7 @@ Invoke-RestMethod -Method Post `
 ## 遇到的问题和解决
 
 1. **短期工作记忆会把全局缺口误作当前缺口：** 若按工具调用流水账给 ReAct 展示其他 target 的资料和失败，它会把“后续 target 还没搜”误判为当前 target 未完成，造成重复搜索。现在每轮只提供当前 target 的完成条件、局部 Observation、覆盖、缺口、额度和必要约束/记忆；全局计划、其他 target 状态、跨任务证据只由 Controller、Replan 和 Judge 使用。这样 ReAct 主要回答“当前目标还缺什么”，而不是重放整个历史。
-2. **参数 JSON Schema 合法却不服务当前目标：** 例如当前是“苏州天气”，模型却准备以 `city=Nanjing` 调天气工具；仅做调用后的核验虽能阻止证据污染，却已浪费 MCP 配额。现在每次 MCP 前增加独立的 `ToolBindingAssessment`，只输出 `{bound, reason}`。预检不通过会反馈 ReAct、消耗本 target 的预检额度，但不消耗 MCP 调用额度；每 target 最多 3 次预检和 3 次 MCP 调用。
+2. **参数 JSON Schema 合法却不服务当前目标：** 例如当前是“苏州天气”，模型却准备以 `city=Nanjing` 调天气工具；仅做调用后的核验虽能阻止证据污染，却已浪费 MCP 配额。现在每次 MCP 前增加独立的 `ToolBindingAssessment`，只输出 `{bound, reason}`，并只要求这次调用能补齐当前 target 的任一未满足 criterion，而非独立完成整个 target。预检不通过会反馈 ReAct、消耗本 target 的预检额度，但不消耗 MCP 调用额度；每 target 最多 6 次预检和 3 次 MCP 调用。
 3. **调用成功不等于观察支持当前 target：** Gateway 成功只说明传输成功，返回内容仍可能无关、无法核验或只碰巧关联别的目标。现在 `ObservationAssessment` 额外输出 `supports_current_target` 与 `coverage_contribution`；只有直接支持当前 target 的 relevant/partial 观察进入该 target 的 Settlement 和正式 Evidence。
 4. **跨 target 信息会污染覆盖状态：** 一条 Observation 可能意外提到另一个 target，但不能因此自动完成或改变那个 target。现在 `related_target_ids` 仅作为旁路 metadata 与资料账本记录；不会更新其他 target 的 coverage、status 或 ReAct 上下文。是否在后续全局调度中利用，只由 Controller/Replan 决定。
 5. **`partial` 既像“继续”又像“结束”：** 这会让模型过早离开信息不足的 target。现在 Settlement 必须逐项返回 completion criteria 的满足情况；只有 `target_complete=true` 才能提前结束。所有 partial 结算都会带着累计资料回到当前 ReAct，直到完成或该 target 自己的额度耗尽后才单向进入下一个 target。
@@ -953,11 +953,12 @@ Invoke-RestMethod -Method Post `
 8. **`blocked` 任务曾被当作依赖已完成：** 现在 `blocked`、`failed`、`skipped` 均不能解锁下游；已有可用资料但仍存在普通缺口的任务使用 `completed_with_gaps`，可解除普通依赖，同时把不确定性留给总控与最终报告。
 9. **互补证据被误判为矛盾：** 证据按任务、target、工具和参数建立 `scope_key`；只有同范围资料才交给模型判断 supports、complements、contradicts 或 uncertain，模型不可用时保守保持 uncertain。
 10. **`target_key` 被过宽脱敏：** 脱敏规则只遮蔽明确的凭据字段或凭据后缀，保留 target ID 与普通业务字段，以便 Trace 和前端正确显示状态。
-11. **已完成 target 的旧失败持续污染总控：** 失败 Observation 会保留 Trace，但现在 AgentResult、Progress Summary 和 Replan 只把未完成 target 的失败与缺口作为当前问题；已 complete target 仅贡献有效 findings。
+11. **已修复的执行失败持续污染总控：** 如果把参数错误、预检拒绝、失败调用或无关 Observation 直接塞进 `AgentResult.uncertainties`，即使后来已补齐资料，总控仍会把它当成当前缺口。现在 Trace/Observation 保存完整审计历史；ReAct 仅短暂保留当前 target 的一次性修正提示；AgentResult、Progress Summary 与 Replan 只读取任务结束时仍未解决的 target `missing_information`（无 target 任务才读取其公开 uncertainties）。
 12. **目标状态缺少部分完成视觉：** 前端以实心圆表示 complete、空心圆表示 pending/blocked、半实心圆表示 partial。
+13. **最终理由把“未找到”误写成“不存在”或彼此矛盾：** 最终裁判在输出前必须对推荐、事实、推断、取舍、风险和不确定性做一致性检查；没有证据只能标记“尚未证实”，不能做否定性事实断言。
 
 ## Agent 测评与未来完善
 
 可建立固定题集：为每题保存期望任务/Trace 行为、允许工具范围、证据覆盖标准、最终报告评分规则；每次改动模型、Prompt、MCP、记忆或工作流后比较任务完成率、工具成功率、重复率、重规划次数、HITL 触发质量、证据覆盖、置信度校准和不确定性标注。
 
-后续可完善：严格拓扑排序和依赖环检测、基于候选项/日期/维度的完成条件验证、来源 URL/域名级证据独立性、工具成本/成功率进入规划、前端 Profile 浏览修正与删除、删除请求失败的用户可见提示，以及版本化评测数据和回归报告。
+后续可完善：基于候选项/日期/维度的完成条件验证、来源 URL/域名级证据独立性、工具成本/成功率进入规划、前端 Profile 浏览修正与删除、删除请求失败的用户可见提示，以及版本化评测数据和回归报告、同一会话不同状态/decision的切换。

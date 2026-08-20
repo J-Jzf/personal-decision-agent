@@ -226,6 +226,9 @@ class ModelAdapter:
                 operation="judge",
                 system="你是决策裁判。只使用载荷中的证据和总控进度摘要，严格按 JSON Schema 输出，不编造外部事实。"
                 "必须区分已完成、证据不足与未验证的信息；不得把任务未完成误写为已确认。"
+                "输出前自行检查：推荐、confirmed_facts、external_views、inferences、tradeoffs、risks 与 uncertainties 之间不得互相矛盾；"
+                "每条事实性理由必须能追溯到载荷 Evidence 或明确标注为推断。未找到证据只能写为‘未找到足以确认的证据’或‘尚未证实’，"
+                "不得将其改写为该事实不存在、没有发生或不可能发生。"
                 f"{EVIDENCE_SUFFICIENCY_GUIDANCE}",
                 payload={"request": request.model_dump(mode="json"), "evidence": [item.model_dump(mode="json") for item in (evidence or [])],
                          "memory": memory.model_dump(mode="json") if memory else {}, "dimensions": dimensions or [],
@@ -388,22 +391,39 @@ class ModelAdapter:
     async def assess_tool_binding_or_fallback(self, *, request: DecisionRequest, task: TaskSpec,
                                                target: dict[str, Any], tool: dict[str, Any],
                                                arguments: dict[str, Any]) -> ToolBindingAssessment:
-        """在调用 MCP 前验证参数是否实际服务当前信息目标。"""
+        """在调用 MCP 前验证参数能否补齐当前目标至少一项未满足条件。"""
+        settlements = target.get("settlement_criteria", [])
+        unsettled = [
+            item.get("criterion") for item in settlements
+            if isinstance(item, dict) and item.get("satisfied") is False and isinstance(item.get("criterion"), str)
+        ]
+        if not unsettled:
+            unsettled = list(target.get("missing_information") or target.get("completion_criteria", []))
+        binding_target = {
+            key: target[key] for key in ("target_id", "objective") if key in target
+        }
+        binding_target["unresolved_completion_criteria"] = unsettled
+        if settlements:
+            binding_target["criterion_settlement"] = [
+                {"criterion": item.get("criterion"), "satisfied": item.get("satisfied")}
+                for item in settlements if isinstance(item, dict)
+            ]
         try:
             return await self._structured_with_repair(
                 operation="tool_binding_assessment",
                 system=(
-                    "你是 MCP 工具调用前的语义绑定核验器。只根据用户约束、当前任务、当前信息目标及其完成条件、"
-                    "所选工具和参数判断这组参数是否直接服务当前信息目标。"
+                    "你是 MCP 工具调用前的语义绑定核验器。只根据用户约束、当前任务、当前信息目标的尚未完成 criterion、"
+                    "所选工具和参数判断这组参数是否能实质帮助补齐至少一项尚未完成 criterion。"
+                    "不要求单次调用独立完成整个 target；只要可合理补齐其中一项未满足条件，bound 就应为 true。"
                     "参数符合 JSON Schema、工具被允许或任务提到相近实体，都不代表已经绑定。"
-                    "若参数查询的是另一城市、另一候选项、另一日期或另一资料目标，bound 必须为 false，并给出可公开的简短修正原因。"
+                    "若参数查询的是另一城市、另一候选项、另一日期、已满足条件，或与所有尚未完成 criterion 无关，bound 必须为 false，并给出可公开的简短修正原因。"
                     "不得看到、推断或提及其他信息目标，不得编造外部事实或私有思维链。"
                 ),
                 payload={
                     "user_question": request.query,
                     "constraints": request.constraints,
                     "task": {"task_id": task.task_id, "objective": task.objective},
-                    "current_target": target,
+                    "current_target": binding_target,
                     "selected_tool": tool,
                     "arguments": arguments,
                 },
@@ -413,7 +433,7 @@ class ModelAdapter:
             self._fallback("tool_binding_assessment", error)
             return ToolBindingAssessment(
                 bound=False,
-                reason="调用前语义绑定模型不可用，无法安全确认工具参数服务当前信息目标。",
+                reason="调用前语义绑定模型不可用，无法安全确认工具参数可补齐当前目标的未满足条件。",
             )
 
     async def assess_observation_or_fallback(self, *, request: DecisionRequest, task: TaskSpec,

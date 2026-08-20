@@ -599,6 +599,30 @@ def test_react_repair_message_is_consumed_once_for_its_own_target():
     assert "react_validation_error" not in context.execution_context
 
 
+def test_agent_result_excludes_historical_failures_and_keeps_only_final_target_gaps():
+    """专家结果是总控长期输入，不能把已处理的调用失败当作事实缺口。"""
+    from models.contracts import TaskSpec
+
+    task = TaskSpec(task_id="weather", objective="查询天气", agent=AgentName.EVIDENCE_RESEARCH)
+    context = AgentContext(
+        decision_id="d", memory=MemoryContext(),
+        information_targets=[{
+            "target_id": "weekend", "objective": "苏州天气", "status": "partial",
+            "missing_information": ["苏州周日降雨概率"], "tool_calls_used": 1,
+        }],
+        observations=[ToolObservation(
+            call_id="failed-call", decision_id="d", task_id="weather", target_id="weekend",
+            agent=AgentName.EVIDENCE_RESEARCH, tool_name="weather", status=ToolCallStatus.FAILED,
+            error="历史参数错误：city=Nanjing",
+        )],
+    )
+
+    result = asyncio.run(BaseReActAgent().finish(task, context, used=1))
+
+    assert "历史参数错误：city=Nanjing" not in result.uncertainties
+    assert "苏州周日降雨概率" in result.uncertainties
+
+
 def test_general_agent_delegates_factual_work_then_synthesizes_results():
     """General 不直连 MCP，而是消费受限事实专家的委派结果再综合。"""
     from agents.general import GeneralAgent

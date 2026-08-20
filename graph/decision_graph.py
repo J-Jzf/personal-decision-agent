@@ -560,14 +560,10 @@ class DecisionGraph:
 
     @staticmethod
     def _replan_context(state: DecisionState, pool: EvidencePool) -> dict[str, Any]:
-        """为总控提供已完成工作和失败原因，使其增量生成替代计划。"""
+        """为总控提供最终未解决缺口；原始失败只留在可审计 Trace。"""
         unmet_gaps = list(state.plan.missing_information) if state.plan else []
         for result in state.agent_results:
-            if result.completion_status != TaskStatus.COMPLETED:
-                unmet_gaps.extend(result.uncertainties or [f"任务 {result.task_id} 未完成"])
-        for observation in state.tool_observations:
-            if observation.status != ToolCallStatus.SUCCEEDED and observation.error and DecisionGraph._observation_target_is_unresolved(state, observation):
-                unmet_gaps.append(observation.error)
+            unmet_gaps.extend(DecisionGraph._final_task_gaps(state, result))
         # 证据账本保留可引用的跨目标资料；正式 Evidence 仍只收录直接支撑其所属目标的观察。
         return {
             "completed_tasks": [
@@ -588,18 +584,7 @@ class DecisionGraph:
                 for evidence in pool.list()
                 if evidence.status in {EvidenceStatus.CONFIRMED, EvidenceStatus.UNVERIFIED}
             ],
-            "failed_tools": [
-                {
-                    "tool_name": observation.tool_name, "task_id": observation.task_id,
-                    "arguments": observation.arguments, "status": observation.status.value,
-                    "error": observation.error,
-                    "semantic_status": observation.semantic_status.value if observation.semantic_status else None,
-                    "semantic_summary": observation.semantic_summary,
-                }
-                for observation in state.tool_observations
-                if not DecisionGraph._observation_is_referenceable(observation)
-                and DecisionGraph._observation_target_is_unresolved(state, observation)
-            ],
+            "failed_tools": [],
             "unmet_gaps": list(dict.fromkeys(item for item in unmet_gaps if item)),
             "task_statuses": list(state.task_ledger.values()),
             "all_successful_information": DecisionGraph._all_successful_information(state),
@@ -708,11 +693,10 @@ class DecisionGraph:
                 rendered = str(evidence.value)
                 if rendered not in information:
                     information.append(rendered)
-        # completed_with_gaps 可以继续下游，但其缺口仍需显式暴露给总控决定是否重规划。
+        # completed_with_gaps 可以继续下游，但只暴露 target 最终结算的缺口，绝不回放历史失败。
         missing = list(state.plan.missing_information) if state.plan else []
         for result in state.agent_results:
-            if result.completion_status != TaskStatus.COMPLETED:
-                missing.extend(result.uncertainties or [f"任务 {result.task_id} 尚未完成"])
+            missing.extend(DecisionGraph._final_task_gaps(state, result))
         waiting_tasks = [task for task in (state.plan.tasks if state.plan else []) if task.task_id not in {item["task_id"] for item in completed}]
         if latest_result.completion_status not in {TaskStatus.COMPLETED, TaskStatus.COMPLETED_WITH_GAPS}:
             next_step: str | list[dict[str, str]] = "根据未满足条件和失败原因生成可执行补充任务；无可执行任务时进入核验与最终判断。"
@@ -728,6 +712,24 @@ class DecisionGraph:
             "仍缺少或存在冲突的信息": list(dict.fromkeys(item for item in missing if item)),
             "下一步应该做": next_step,
         }
+
+    @staticmethod
+    def _final_task_gaps(state: DecisionState, result) -> list[str]:
+        """以持久化 target 结算为准提取最终缺口；无 target 的任务才使用自身公开不确定性。"""
+        targets = state.information_targets.get(result.task_id, [])
+        if targets:
+            gaps: list[str] = []
+            for target in targets:
+                if target.get("status") == "complete":
+                    continue
+                target_gaps = target.get("missing_information", [])
+                gaps.extend(item for item in target_gaps if isinstance(item, str) and item.strip())
+                if not target_gaps:
+                    gaps.append(f"信息目标未完整覆盖：{target.get('objective', target.get('target_id', result.task_id))}")
+            return gaps
+        if result.completion_status != TaskStatus.COMPLETED:
+            return list(result.uncertainties or [f"任务 {result.task_id} 尚未完成"])
+        return []
 
     @staticmethod
     def _controller_execution_context(state: DecisionState, pool: EvidencePool) -> dict[str, Any]:

@@ -248,6 +248,29 @@ def test_replan_context_hides_failures_from_a_completed_target():
     assert context["failed_tools"] == []
 
 
+def test_progress_summary_keeps_only_final_target_gaps_not_repaired_failure_history():
+    """总控摘要必须读取 target 最终结算缺口，而非 completed_with_gaps 的旧失败文案。"""
+    from models.contracts import AgentName, AgentResult, ExecutionPlan, TaskSpec, TaskStatus
+
+    state = DecisionState(
+        decision_id="d", request=DecisionRequest(query="比较"),
+        plan=ExecutionPlan(tasks=[TaskSpec(task_id="weather", objective="天气", agent=AgentName.LOCATION_LIFESTYLE)]),
+        information_targets={"weather": [{
+            "target_id": "weekend", "status": "partial",
+            "missing_information": ["苏州周日降雨概率"],
+        }]},
+        agent_results=[AgentResult(
+            result_id="r", decision_id="d", task_id="weather", agent_name=AgentName.LOCATION_LIFESTYLE,
+            findings=["苏州周六天气已确认"], uncertainties=["历史参数错误：city=Nanjing"],
+            completion_status=TaskStatus.COMPLETED_WITH_GAPS,
+        )],
+    )
+
+    summary = DecisionGraph.build_progress_summary(state, EvidencePool(), state.agent_results[0])
+
+    assert summary["仍缺少或存在冲突的信息"] == ["苏州周日降雨概率"]
+
+
 def test_replan_without_an_executable_task_is_rejected():
     """重规划不能只输出缺口说明；无任务时应直接转入后续判断。"""
     assert not DecisionGraph.has_executable_replan_tasks([], ["上海 23 日天气缺失"])

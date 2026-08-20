@@ -363,7 +363,7 @@ class TargetCriterionSettlement(ContractModel):
 
 
 class ToolBindingAssessment(ContractModel):
-    """调用前验证工具参数是否直接服务当前信息目标。"""
+    """调用前验证工具参数是否可补齐当前目标的一项未满足完成条件。"""
 
     bound: bool
     reason: str = Field(default="", max_length=800)

@@ -322,6 +322,8 @@ def test_judge_repairs_invalid_json_with_full_schema_and_user_information_bounda
         assert "不要编造用户信息" in calls[0]["messages"][0]["content"]
         assert "信息达到可支持结论的参考程度即可" in calls[0]["messages"][0]["content"]
         assert "保守推断" in calls[0]["messages"][0]["content"]
+        assert "输出前自行检查" in calls[0]["messages"][0]["content"]
+        assert "未找到证据" in calls[0]["messages"][0]["content"]
         assert "previous_validation_error" in calls[1]["messages"][1]["content"]
 
     asyncio.run(scenario())
@@ -390,14 +392,22 @@ def test_observation_assessment_falls_back_to_unverifiable_when_model_is_unavail
     assert assessment.relevance == "unverifiable"
 
 
-def test_tool_binding_preflight_uses_only_the_current_target_and_selected_action():
-    """预检必须在 MCP 前判断南京参数不能服务苏州目标，且不注入其他 target。"""
+def test_tool_binding_preflight_uses_only_unfinished_current_criteria_and_selected_action():
+    """预检只需证明调用可补当前未满足 criterion，不能要求单次完成整个 target。"""
     async def scenario():
         adapter = ModelAdapter(Settings(llm_model_id="fake", llm_api_key="key"), client=ToolBindingClient())
         assessment = await adapter.assess_tool_binding_or_fallback(
             request=DecisionRequest(query="南京和苏州周末旅游怎么选", constraints=["预算 3000"]),
             task=TaskSpec(task_id="weather", objective="比较周末天气", agent=AgentName.LOCATION_LIFESTYLE),
-            target={"target_id": "suzhou-weather", "objective": "获取苏州天气", "completion_criteria": ["苏州天气"]},
+            target={
+                "target_id": "suzhou-weather", "objective": "获取苏州周末信息",
+                "completion_criteria": ["苏州位置已确认", "苏州天气"],
+                "settlement_criteria": [
+                    {"criterion": "苏州位置已确认", "satisfied": True},
+                    {"criterion": "苏州天气", "satisfied": False, "missing": "周末天气"},
+                ],
+                "missing_information": ["周末天气"],
+            },
             tool={"name": "weather", "input_schema": {"type": "object"}}, arguments={"city": "Nanjing"},
         )
 
@@ -406,6 +416,9 @@ def test_tool_binding_preflight_uses_only_the_current_target_and_selected_action
         assert "苏州天气" in body
         assert "Nanjing" in body
         assert "known_information_targets" not in body
+        prompt = ToolBindingClient.chat.completions.calls[0]["messages"][0]["content"]
+        assert "尚未完成 criterion" in prompt
+        assert "单次调用独立完成整个 target" in prompt
 
     asyncio.run(scenario())
 
