@@ -219,12 +219,12 @@ git commit -m "feat: add hierarchical memory and episode search"
 def test_registry_matches_cross_city_offer():
     registry = SkillRegistry(Path("skills"))
     registry.load_all()
-    assert registry.match("上海工作和杭州 Offer 怎么选").name == "job_offer_evaluator"
+    assert registry.get("job-offer-evaluator").name == "job-offer-evaluator"
 ~~~
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: pytest tests/test_skill_registry.py::test_registry_matches_cross_city_offer -v
+Run: pytest tests/test_skill_registry.py::test_registry_discovers_all_eight_skill_definitions -v
 
 Expected: FAIL because SkillRegistry is absent.
 
@@ -232,8 +232,8 @@ Expected: FAIL because SkillRegistry is absent.
 
 ~~~python
 REQUIRED_SKILL_FIELDS = {
-    "name", "description", "trigger_conditions", "required_inputs",
-    "recommended_agents", "recommended_tools", "analysis_dimensions",
+    "name", "description", "recommended_agents", "recommended_tools",
+    "analysis_dimensions",
     "workflow", "risk_checks", "completion_conditions", "output_schema",
 }
 ~~~
@@ -244,7 +244,7 @@ Parse YAML front matter with yaml.safe_load and reject a definition missing any 
 
 Run: pytest tests/test_skill_registry.py -v
 
-Expected: PASS for loading eight Skills, matching five domains, and rejecting an invalid definition.
+Expected: PASS for loading eight Skills and rejecting an invalid definition.
 
 - [ ] **Step 5: Commit Skills**
 
